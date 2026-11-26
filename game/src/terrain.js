@@ -1,13 +1,18 @@
 // terrain.js: the island itself — what kind of ground is at (x, z),
-// how high it is, and what colour it paints at dusk.
+// how high it is, and what colour it paints at dusk. One function feeds
+// both the physics (world.js) and the 3D mesh (render.js), so the plane
+// never disagrees with the ground it sees.
+
+import { CFG } from './config.js';
+import { makeRng, valueNoise, hash2 } from './random.js';
 
 // Elliptical distance from the island centre (0, 0). r < 1 is land.
-function islandR(x, z) {
+export function islandR(x, z) {
   const ex = x / CFG.ISLAND_RX, ez = z / CFG.ISLAND_RZ;
   return Math.sqrt(ex * ex + ez * ez);
 }
 
-function terrainAt(x, z) {
+export function terrainAt(x, z) {
   const r = islandR(x, z);
   const dv = Math.hypot(x - CFG.VOLCANO.x, z - CFG.VOLCANO.z);
   const dl = Math.hypot(x - CFG.LAKE.x, z - CFG.LAKE.z);
@@ -15,6 +20,9 @@ function terrainAt(x, z) {
   const rx = x - CFG.RUNWAY.x, rz = z - CFG.RUNWAY.z;
   const onRunway = Math.abs(rx) < CFG.RUNWAY.len / 2 && Math.abs(rz) < CFG.RUNWAY.w / 2;
   if (onRunway) return { t: 'runway', h: 4 };
+  // Village pad: flat ground for the houses, east of the runway.
+  const vx = x - CFG.VILLAGE.x, vz = z - CFG.VILLAGE.z;
+  if (Math.abs(vx) < 120 && Math.abs(vz) < 90) return { t: 'village', h: 5 };
   if (dl < CFG.LAKE.r) return { t: 'lake', h: 2 };
   if (r > 1) return { t: 'sea', h: 0 };
   // Rolling hills that rise towards the middle of the island.
@@ -28,38 +36,31 @@ function terrainAt(x, z) {
   const forest = valueNoise(x * 0.006 + 7.3, z * 0.006 - 2.1) > 0.58;
   if (forest) return { t: 'forest', h };
   const field = valueNoise(x * 0.004 + 40.7, z * 0.004 - 11.9);
-  if (field > 0.44 && field < 0.52) return { t: 'field', h };
+  if (field > 0.40 && field < 0.56) return { t: 'field', h };
   return { t: 'grass', h };
 }
 
-// Dusk palette. `dist` is the depth of the sample, for the haze.
-function terrainColor(kind, x, z, dist) {
-  let c;
-  if (kind === 'sea') {
-    const s = hash2(Math.floor(x / 70), Math.floor(z / 70));
-    c = s > 0.5 ? [36, 95, 143] : [30, 84, 128];
-  } else if (kind === 'lake') c = [46, 127, 180];
-  else if (kind === 'sand') c = [207, 169, 110];
-  else if (kind === 'grass') c = [85, 118, 60];
-  else if (kind === 'forest') c = [44, 90, 42];
-  else if (kind === 'field') c = [168, 137, 78];
-  else if (kind === 'rock') c = [107, 93, 80];
-  else if (kind === 'ash') c = [69, 63, 58];
-  else c = [51, 54, 59]; // runway asphalt
-  // Warm haze swallows the far ground at dusk.
-  const k = Math.min(0.55, (dist / 2600) * 0.55);
-  const r = Math.round(c[0] + (232 - c[0]) * k);
-  const g = Math.round(c[1] + (149 - c[1]) * k);
-  const b = Math.round(c[2] + (106 - c[2]) * k);
-  return 'rgb(' + r + ',' + g + ',' + b + ')';
+// Dusk palette, as plain [r, g, b] triples. The sun and fog do the haze;
+// these are the colours the ground is.
+export function terrainColor(kind) {
+  if (kind === 'sea') return [33, 88, 138];
+  if (kind === 'lake') return [46, 127, 180];
+  if (kind === 'sand') return [207, 169, 110];
+  if (kind === 'grass') return [95, 128, 66];
+  if (kind === 'forest') return [52, 102, 48];
+  if (kind === 'field') return [168, 137, 78];
+  if (kind === 'rock') return [92, 82, 76];
+  if (kind === 'ash') return [60, 54, 50];
+  if (kind === 'village') return [120, 104, 78];
+  return [51, 54, 59]; // runway asphalt
 }
 
-// The fires start in the forest, away from the runway and the volcano.
-function fireSpots(seed) {
+// Forest fires start in the forest, away from the runway and the volcano.
+export function forestFireSpots(seed) {
   const rng = makeRng(seed);
   const spots = [];
   let guard = 0;
-  while (spots.length < CFG.FIRES_START && guard++ < 4000) {
+  while (spots.length < CFG.FIRES_FOREST && guard++ < 4000) {
     const a = rng() * Math.PI * 2;
     const rr = 0.25 + rng() * 0.6;
     const x = Math.cos(a) * CFG.ISLAND_RX * rr;
@@ -72,4 +73,34 @@ function fireSpots(seed) {
     spots.push({ x, z });
   }
   return spots;
+}
+
+// The two building fires: two houses in the village, east of the runway.
+export function buildingFireSpots() {
+  const V = CFG.VILLAGE;
+  return [
+    { x: V.x - 45, z: V.z - 30 },
+    { x: V.x + 55, z: V.z + 25 },
+  ];
+}
+
+// Pine positions for the instanced tree mesh: only where the ground is
+// forest, and never on the runway, the lake, the village or the volcano.
+export function treeSpots(count, seed) {
+  const rng = makeRng(seed);
+  const spots = [];
+  let guard = 0;
+  while (spots.length < count && guard++ < count * 40) {
+    const x = (rng() * 2 - 1) * CFG.ISLAND_RX * 0.95;
+    const z = (rng() * 2 - 1) * CFG.ISLAND_RZ * 0.95;
+    if (terrainAt(x, z).t !== 'forest') continue;
+    const s = 0.7 + rng() * 0.9;
+    spots.push({ x, z, h: terrainAt(x, z).h, s, rot: rng() * Math.PI * 2 });
+  }
+  return spots;
+}
+
+// A cheap deterministic speckle so the sea is not one flat colour.
+export function seaShade(x, z) {
+  return hash2(Math.floor(x / 70), Math.floor(z / 70)) > 0.5 ? 1 : 0.88;
 }

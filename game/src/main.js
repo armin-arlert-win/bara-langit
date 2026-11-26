@@ -1,19 +1,27 @@
 // main.js: the loop, the screens, and the self-test. Boots the game,
 // steps the world, draws every frame, and answers Enter, Space, P and M.
 
+import { CFG } from './config.js';
+import { newGame, updateWorld, dropWater } from './world.js';
+import { KEYS, bindInput, consumePress, consumeClick } from './input.js';
+import { ensureAudio, engineSound } from './audio.js';
+import { initRender, buildWorldVisuals, renderFrame } from './render.js';
+import { updateHud, showScreen } from './hud.js';
+import { applyShot, SHOT_TIME } from './shots.js';
+
 let G = newGame();
 let paused = false;
 let animT = 0;
 let lastNow = 0;
 
 const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
 
 function startSortie() {
   ensureAudio();
   G = newGame();
   G.state = 'playing';
   paused = false;
+  showScreen('none', G);
 }
 
 function frame(now) {
@@ -27,17 +35,21 @@ function frame(now) {
       startSortie();
     }
   }
-  if (consumePress('p') && G.state === 'playing') paused = !paused;
+  if (consumePress('p') && (G.state === 'playing' || G.state === 'return')) paused = !paused;
   if (consumePress('m')) {
-    muted = !muted;
-    if (engineGain) engineGain.gain.value = 0;
+    // Mute is handled inside the audio module's own flag; here we just
+    // note the press so the key does nothing else.
   }
-  if (G.state === 'playing' && !paused) {
+  if ((G.state === 'playing' || G.state === 'return') && !paused) {
     if (consumePress(' ')) dropWater(G);
     updateWorld(G, dt);
     engineSound(G.throttle, G.speed);
+    if (G.state === 'win' || G.state === 'lose' || G.state === 'crash') {
+      showScreen(G.state, G);
+    }
   }
-  render(ctx, G, animT);
+  renderFrame(G, animT, false);
+  updateHud(G);
 }
 
 // --- Self-test: ?selftest=1 runs the game headlessly through its paces
@@ -67,7 +79,7 @@ function runSelfTest() {
     step(g, 2);
     KEYS.arrowleft = false;
     check('bank turns heading', Math.abs(g.heading - h0) > 0.15);
-    // 3 — a drop on a fire puts it out.
+    // 3 — a drop on a forest fire puts it out.
     const f = g.fires[0];
     g.x = f.x; g.z = f.z + 172.5; g.heading = 0; g.alt = 150;
     const before = f.intensity;
@@ -79,28 +91,44 @@ function runSelfTest() {
     g.x = 0; g.z = -1700; g.alt = 2; g.speed = 40; g.throttle = 0; g.water = 0;
     step(g, 4);
     check('sea skim refills tank', g.water > 1);
-    // 5 — the last fire out wins the sortie.
+    // 5 — the last fire out sends her home.
     g = newGame();
     g.state = 'playing';
     for (const ff of g.fires) ff.alive = false;
     step(g, 0.1);
-    check('all fires out wins', g.state === 'win');
-    // 6 — the ground is not forgiving.
+    check('all fires out starts the return', g.phase === 'return' && g.timeLeft > CFG.TIME_LIMIT);
+    // 6 — a precision landing on the runway wins the sortie.
+    g = newGame();
+    g.state = 'return';
+    g.phase = 'return';
+    g.x = CFG.RUNWAY.x - 100; g.z = CFG.RUNWAY.z;
+    g.alt = 6; g.speed = 40; g.throttle = 0;
+    g.heading = Math.PI / 2; g.pitch = 0; g.roll = 0;
+    step(g, 0.5);
+    check('precision landing wins', g.state === 'win' && g.landingBonus > 0);
+    // 7 — a drop on a burning house scores the building points.
+    g = newGame();
+    g.state = 'playing';
+    const b = g.fires.find((ff) => ff.kind === 'building');
+    g.x = b.x; g.z = b.z + 172.5; g.heading = 0; g.alt = 150;
+    dropWater(g);
+    check('building fire scores 150', g.score >= 150);
+    // 8 — the ground is not forgiving.
     g = newGame();
     g.state = 'playing';
     g.x = 0; g.z = 0; g.alt = 50;
     step(g, 0.1);
     check('hitting terrain crashes', g.state === 'crash');
-    // 7 — the clock runs.
+    // 9 — the clock runs.
     g = newGame();
     g.state = 'playing';
     const t0 = g.timeLeft;
     step(g, 1);
     check('clock counts down', g.timeLeft < t0);
-    // 8 — one frame draws without throwing.
+    // 10 — one frame draws without throwing.
     const gg = newGame();
     gg.state = 'playing';
-    render(ctx, gg, 8.0);
+    renderFrame(gg, SHOT_TIME, true);
     check('frame renders', true);
   } catch (err) {
     results.push(['EXCEPTION: ' + (err && err.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : String(err)), false]);
@@ -117,6 +145,8 @@ function runSelfTest() {
 
 function boot() {
   bindInput();
+  initRender(canvas);
+  buildWorldVisuals(G);
   const q = new URLSearchParams(location.search);
   if (q.get('selftest') === '1') {
     runSelfTest();
@@ -126,13 +156,18 @@ function boot() {
   if (shot >= 1 && shot <= 4) {
     // One frozen frame: the same state, the same clock, every capture.
     G = applyShot(shot);
-    render(ctx, G, SHOT_TIME);
+    renderFrame(G, SHOT_TIME, true);
+    updateHud(G);
+    if (shot === 4) showScreen('win', G);
+    else showScreen('none', G);
     document.title = 'SHOT ' + shot;
     return;
   }
-  // Title screen over a live scenic backdrop: the plane circles the island.
-  G.x = -900; G.z = 1150; G.alt = 300; G.speed = 55; G.throttle = 0.5;
-  G.heading = 0.6;
+  // Title screen over a live scenic backdrop: the camera orbits the island.
+  G.x = CFG.RUNWAY.x - 250; G.z = CFG.RUNWAY.z;
+  G.alt = 5; G.speed = 0; G.throttle = 0;
+  G.heading = Math.PI / 2;
+  showScreen('title', G);
   requestAnimationFrame(frame);
 }
 

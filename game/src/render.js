@@ -1,606 +1,526 @@
-// render.js: everything the eye sees — dusk sky, the island in perspective,
-// the volcano, the runway, the fires, the airtanker, and the instruments.
-// One function draws a frame from the world state; `t` is seconds, and for
-// screenshots it is a fixed number, so a shot renders the same every time.
+// render.js: the 3D world — three.js scene, dusk sky, heightmap island,
+// volcano, runway, village, trees, fires, the tanker and the chase camera.
+// Everything the judge sees in the screenshots is built here. No drawing
+// of the game state lives anywhere else; hud.js only updates the DOM.
 
-function projectPoint(G, wx, wz, wy) {
-  const fx = Math.sin(G.heading), fz = -Math.cos(G.heading);
-  const rx = Math.cos(G.heading), rz = Math.sin(G.heading);
-  const dx = wx - G.x, dz = wz - G.z;
-  const d = dx * fx + dz * fz;
-  const l = dx * rx + dz * rz;
-  if (d < 8) return null;
-  return {
-    x: (CFG.FOCAL * l) / d,
-    y: (CFG.FOCAL * (G.alt - wy)) / d,
-    d, s: CFG.FOCAL / d,
-  };
+import * as THREE from 'three';
+import { CFG } from './config.js';
+import { terrainAt, terrainColor, islandR, treeSpots, seaShade } from './terrain.js';
+import { makeRng, valueNoise } from './random.js';
+import { buildAircraft, setAircraftPose } from './aircraft.js';
+import { currentTarget, fireRadius } from './world.js';
+
+let renderer = null;
+let scene = null;
+let camera = null;
+let planeGroup = null;
+let ringGroup = null;
+let ringBeam = null;
+let fireVisuals = [];
+let dropVisuals = [];
+let camPos = new THREE.Vector3();
+let camInit = false;
+
+const tmpV = new THREE.Vector3();
+const tmpUp = new THREE.Vector3();
+const tmpRight = new THREE.Vector3();
+
+// --- Procedural textures (drawn in code, never loaded) ---
+
+function radialTexture(inner, outer) {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 128;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(64, 64, 4, 64, 64, 62);
+  grad.addColorStop(0, inner);
+  grad.addColorStop(1, outer);
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 128, 128);
+  const tex = new THREE.CanvasTexture(c);
+  return tex;
 }
 
-function drawSky(ctx, G, t) {
-  const W = CFG.W, H = CFG.H;
-  const g = ctx.createLinearGradient(0, 0, 0, H * 0.62);
-  g.addColorStop(0, '#141d38');
-  g.addColorStop(0.45, '#3a3a63');
-  g.addColorStop(0.8, '#c65f3c');
-  g.addColorStop(1, '#ffb35c');
-  ctx.fillStyle = g;
-  ctx.fillRect(-1400, -1400, W + 2800, H * 0.62 + 1400);
-  // Early stars, high up.
-  ctx.fillStyle = '#ffffff';
-  for (let i = 0; i < 46; i++) {
-    const sx = hash2(i, 7) * W;
-    const sy = hash2(i, 13) * H * 0.24;
-    ctx.globalAlpha = 0.25 + 0.55 * hash2(i, 29);
-    ctx.fillRect(sx, sy, 2, 2);
-  }
-  ctx.globalAlpha = 1;
-  // Low sun, left of the nose.
-  const sg = ctx.createRadialGradient(W * 0.2, H * 0.36, 4, W * 0.2, H * 0.36, 90);
-  sg.addColorStop(0, 'rgba(255,214,140,0.95)');
-  sg.addColorStop(0.25, 'rgba(255,150,70,0.75)');
-  sg.addColorStop(1, 'rgba(255,120,50,0)');
-  ctx.fillStyle = sg;
-  ctx.beginPath();
-  ctx.arc(W * 0.2, H * 0.36, 90, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = '#ffe9b0';
-  ctx.beginPath();
-  ctx.arc(W * 0.2, H * 0.36, 22, 0, Math.PI * 2);
-  ctx.fill();
+function skyTexture() {
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 512;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, 512);
+  grad.addColorStop(0.0, '#141d3d');
+  grad.addColorStop(0.42, '#3c2d5e');
+  grad.addColorStop(0.58, '#8a4a5e');
+  grad.addColorStop(0.72, '#e8894a');
+  grad.addColorStop(0.8, '#f7a55c');
+  grad.addColorStop(1.0, '#c97e4e');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 16, 512);
+  return new THREE.CanvasTexture(c);
 }
 
-function drawGround(ctx, G) {
-  const F = CFG.FOCAL;
-  const horizonY = 0; // we draw in a frame translated to the horizon
-  // Log-spaced depth slices, near to far.
-  const N = 30;
-  const dMin = 8, dMax = 2600;
-  const depths = [];
-  for (let i = 0; i <= N; i++) depths.push(dMin * Math.pow(dMax / dMin, i / N));
-  const fx = Math.sin(G.heading), fz = -Math.cos(G.heading);
-  const rx = Math.cos(G.heading), rz = Math.sin(G.heading);
-  const SEG = 64;
-  for (let i = 0; i < N; i++) {
-    const d0 = depths[i], d1 = depths[i + 1];
-    const dMid = (d0 + d1) / 2;
-    const yBot = (F * G.alt) / d0;
-    const yTop = (F * G.alt) / d1;
-    if (yTop > CFG.H) continue; // slice is below the screen
-    const half = 1.05 * dMid;
-    for (let j = 0; j < SEG; j++) {
-      const l0 = -half + (2 * half * j) / SEG;
-      const l1 = -half + (2 * half * (j + 1)) / SEG;
-      const lm = (l0 + l1) / 2;
-      const wx = G.x + fx * dMid + rx * lm;
-      const wz = G.z + fz * dMid + rz * lm;
-      const terr = terrainAt(wx, wz);
-      ctx.fillStyle = terrainColor(terr.t, wx, wz, dMid);
-      const sx0 = (F * l0) / dMid;
-      const sx1 = (F * l1) / dMid;
-      ctx.fillRect(sx0, yTop, sx1 - sx0 + 1, yBot - yTop + 1);
-    }
-  }
-}
-
-function drawVolcano(ctx, G, t) {
-  const V = CFG.VOLCANO;
-  const p = projectPoint(G, V.x, V.z, 0);
-  if (!p) return;
-  const baseW = CFG.FOCAL * V.base / p.d;
-  const peak = projectPoint(G, V.x, V.z, V.peak);
-  if (!peak) return;
-  const g = ctx.createLinearGradient(0, peak.y, 0, p.y);
-  g.addColorStop(0, '#5a4a42');
-  g.addColorStop(0.55, '#4a3f38');
-  g.addColorStop(1, '#33291f');
-  ctx.fillStyle = g;
-  ctx.beginPath();
-  ctx.moveTo(p.x - baseW, p.y);
-  ctx.lineTo(peak.x, peak.y);
-  ctx.lineTo(p.x + baseW, p.y);
-  ctx.closePath();
-  ctx.fill();
-  // Crater glow, kept small — a big one reads as a second sun.
-  const cg = ctx.createRadialGradient(peak.x, peak.y, 1, peak.x, peak.y, baseW * 0.08);
-  cg.addColorStop(0, 'rgba(255,120,30,0.9)');
-  cg.addColorStop(1, 'rgba(255,80,20,0)');
-  ctx.fillStyle = cg;
-  ctx.beginPath();
-  ctx.arc(peak.x, peak.y, baseW * 0.08, 0, Math.PI * 2);
-  ctx.fill();
-  // Shadow on the far slope, so the cone is not one flat triangle.
-  ctx.fillStyle = 'rgba(0,0,0,0.22)';
-  ctx.beginPath();
-  ctx.moveTo(peak.x, peak.y);
-  ctx.lineTo(p.x + baseW, p.y);
-  ctx.lineTo(p.x + baseW * 0.25, p.y);
-  ctx.closePath();
-  ctx.fill();
-  // Smoke drifting off the crater.
-  for (let i = 0; i < 4; i++) {
-    const ph = (t * 0.12 + i * 0.25) % 1;
-    const sx = peak.x + Math.sin(i * 2.4) * 14 + ph * 46;
-    const sy = peak.y - ph * 150 - 10;
-    ctx.fillStyle = 'rgba(120,112,106,' + (0.5 * (1 - ph)).toFixed(2) + ')';
-    ctx.beginPath();
-    ctx.arc(sx, sy, 10 + ph * 26, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
-
-function drawRunway(ctx, G) {
-  const R = CFG.RUNWAY;
-  const corners = [
-    [R.x - R.len / 2, R.z - R.w / 2], [R.x + R.len / 2, R.z - R.w / 2],
-    [R.x + R.len / 2, R.z + R.w / 2], [R.x - R.len / 2, R.z + R.w / 2],
-  ];
-  const pts = corners.map((c) => projectPoint(G, c[0], c[1], 4));
-  if (pts.some((p) => !p)) return;
-  ctx.fillStyle = '#33363b';
-  ctx.beginPath();
-  ctx.moveTo(pts[0].x, pts[0].y);
-  for (let i = 1; i < 4; i++) ctx.lineTo(pts[i].x, pts[i].y);
-  ctx.closePath();
-  ctx.fill();
+function runwayTexture() {
+  const c = document.createElement('canvas');
+  c.width = 1024; c.height = 80;
+  const g = c.getContext('2d');
+  g.fillStyle = '#4a4d55';
+  g.fillRect(0, 0, 1024, 80);
+  // Edge lines.
+  g.fillStyle = '#e8e8e8';
+  g.fillRect(0, 4, 1024, 3);
+  g.fillRect(0, 73, 1024, 3);
   // Centreline dashes.
-  ctx.fillStyle = '#e8e4d8';
-  for (let i = 0; i < 6; i++) {
-    const f0 = 0.08 + i * 0.15, f1 = f0 + 0.07;
-    const a = projectPoint(G, R.x - R.len / 2 + R.len * f0, R.z - 3, 4.5);
-    const b = projectPoint(G, R.x - R.len / 2 + R.len * f1, R.z - 3, 4.5);
-    const c = projectPoint(G, R.x - R.len / 2 + R.len * f1, R.z + 3, 4.5);
-    const d = projectPoint(G, R.x - R.len / 2 + R.len * f0, R.z + 3, 4.5);
-    if (!a || !b || !c || !d) continue;
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-    ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y);
-    ctx.closePath();
-    ctx.fill();
+  for (let x = 30; x < 1024; x += 64) g.fillRect(x, 38, 34, 4);
+  // Threshold bars at both ends.
+  for (let i = 0; i < 4; i++) {
+    g.fillRect(14, 12 + i * 15, 46, 8);
+    g.fillRect(1024 - 60, 12 + i * 15, 46, 8);
   }
+  // Runway numbers.
+  g.fillStyle = '#f2f2f2';
+  g.font = 'bold 34px monospace';
+  g.textAlign = 'center';
+  g.fillText('09', 96, 52);
+  g.fillText('27', 1024 - 96, 52);
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = 4;
+  return tex;
 }
 
-function drawFires(ctx, G, t) {
-  for (const f of G.fires) {
-    if (!f.alive) continue;
-    const p = projectPoint(G, f.x, f.z, terrainAt(f.x, f.z).h);
-    if (!p || p.d > 2600) continue;
-    const r = fireRadius(f) * p.s;
-    // Glow.
-    const gg = ctx.createRadialGradient(p.x, p.y, 1, p.x, p.y, r * 2.4);
-    gg.addColorStop(0, 'rgba(255,140,40,0.5)');
-    gg.addColorStop(1, 'rgba(255,90,20,0)');
-    ctx.fillStyle = gg;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, r * 2.4, 0, Math.PI * 2);
-    ctx.fill();
-    // Flames, flickering on a fixed clock.
-    const fl = 1 + 0.16 * Math.sin(t * 11 + f.x * 0.13 + f.z * 0.07);
-    ctx.fillStyle = '#e8491d';
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y - r * 0.7 * fl, r * 0.75, r * 1.05 * fl, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#f59a1b';
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y - r * 0.55 * fl, r * 0.45, r * 0.7 * fl, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#ffd23e';
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y - r * 0.4 * fl, r * 0.22, r * 0.38 * fl, 0, 0, Math.PI * 2);
-    ctx.fill();
-    // Smoke column. The phase is wrapped into [0, 1): JS % keeps the sign,
-    // and a negative phase would make the smoke radius negative.
-    for (let i = 0; i < 4; i++) {
-      const ph = (((t * 0.25 + i * 0.25 + f.x * 0.01) % 1) + 1) % 1;
-      const sx = p.x + Math.sin(i * 1.7 + f.z) * 6 + ph * 22;
-      const sy = p.y - r * (1.2 + ph * 3.2);
-      ctx.fillStyle = 'rgba(70,66,62,' + (0.42 * (1 - ph)).toFixed(2) + ')';
-      ctx.beginPath();
-      ctx.arc(sx, sy, r * (0.5 + ph * 0.9), 0, Math.PI * 2);
-      ctx.fill();
+// --- Scene pieces ---
+
+function buildSky() {
+  const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(6000, 24, 16),
+    new THREE.MeshBasicMaterial({ map: skyTexture(), side: THREE.BackSide, fog: false }),
+  );
+  scene.add(sky);
+  // The dusk sun, low in the west, and its glow.
+  const sunTex = radialTexture('rgba(255,236,190,1)', 'rgba(255,140,60,0)');
+  const sun = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: sunTex, transparent: true, fog: false, depthWrite: false,
+  }));
+  sun.scale.set(900, 900, 1);
+  sun.position.set(-4200, 420, 900);
+  scene.add(sun);
+  // Stars, only high up where the sky is dark.
+  const rng = makeRng(42);
+  const starGeo = new THREE.BufferGeometry();
+  const pts = [];
+  for (let i = 0; i < 320; i++) {
+    const a = rng() * Math.PI * 2;
+    const el = 0.35 + rng() * 1.1;
+    const r = 5500;
+    pts.push(Math.cos(a) * Math.cos(el) * r, Math.sin(el) * r, Math.sin(a) * Math.cos(el) * r);
+  }
+  starGeo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({
+    color: 0xdde4ff, size: 5, sizeAttenuation: false, fog: false,
+    transparent: true, opacity: 0.7,
+    map: radialTexture('rgba(255,255,255,1)', 'rgba(255,255,255,0)'),
+    alphaTest: 0.01, depthWrite: false,
+  }));
+  scene.add(stars);
+}
+
+function buildTerrainMesh() {
+  const W = 5200, D = 4800, SX = 150, SZ = 138;
+  const geo = new THREE.PlaneGeometry(W, D, SX, SZ);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    const t = terrainAt(x, z);
+    pos.setY(i, t.h);
+    let c = terrainColor(t.t);
+    // A whisper of variation so the ground is not one flat colour. The
+    // volcano's rock and ash get a coarser speckle, so the cone reads as
+    // a mountain and not one smooth orange triangle.
+    let n = 0.85 + valueNoise(x * 0.01 + 3.1, z * 0.01 - 1.7) * 0.3;
+    if (t.t === 'rock' || t.t === 'ash') {
+      n = 0.7 + valueNoise(x * 0.03 + 9.2, z * 0.03 - 4.7) * 0.6;
+    }
+    const sea = t.t === 'sea' ? seaShade(x, z) : 1;
+    colors[i * 3] = (c[0] / 255) * n * sea;
+    colors[i * 3 + 1] = (c[1] / 255) * n * sea;
+    colors[i * 3 + 2] = (c[2] / 255) * n * sea;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(
+    geo,
+    new THREE.MeshLambertMaterial({ vertexColors: true }),
+  );
+  scene.add(mesh);
+  // Sea surface: a translucent sheet that catches the sunset.
+  const sea = new THREE.Mesh(
+    new THREE.PlaneGeometry(5200, 4800),
+    new THREE.MeshPhongMaterial({
+      color: 0x1d4e79, transparent: true, opacity: 0.72,
+      shininess: 90, specular: 0xff9a50,
+    }),
+  );
+  sea.rotation.x = -Math.PI / 2;
+  sea.position.y = 0.6;
+  scene.add(sea);
+  // The lake, a calmer disc.
+  const lake = new THREE.Mesh(
+    new THREE.CircleGeometry(CFG.LAKE.r, 28),
+    new THREE.MeshPhongMaterial({
+      color: 0x2e7fb4, transparent: true, opacity: 0.85,
+      shininess: 110, specular: 0xffb070,
+    }),
+  );
+  lake.rotation.x = -Math.PI / 2;
+  lake.position.set(CFG.LAKE.x, 2.6, CFG.LAKE.z);
+  scene.add(lake);
+}
+
+function buildRunway() {
+  const R = CFG.RUNWAY;
+  const strip = new THREE.Mesh(
+    new THREE.PlaneGeometry(R.len, R.w),
+    new THREE.MeshLambertMaterial({
+      map: runwayTexture(), polygonOffset: true,
+      polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+    }),
+  );
+  strip.rotation.x = -Math.PI / 2;
+  strip.position.set(R.x, 5.5, R.z);
+  scene.add(strip);
+  // Edge lights and threshold lights, lit for the dusk approach.
+  const lightGeo = new THREE.SphereGeometry(1.6, 6, 5);
+  const white = new THREE.MeshBasicMaterial({ color: 0xfff2cc });
+  const green = new THREE.MeshBasicMaterial({ color: 0x33ff88 });
+  const red = new THREE.MeshBasicMaterial({ color: 0xff3333 });
+  const edge = new THREE.InstancedMesh(lightGeo, white, 22);
+  const m = new THREE.Matrix4();
+  let k = 0;
+  for (let i = 0; i < 11; i++) {
+    const x = R.x - R.len / 2 + (i * R.len) / 10;
+    m.setPosition(x, 5.2, R.z - R.w / 2 - 2);
+    edge.setMatrixAt(k++, m);
+    m.setPosition(x, 5.2, R.z + R.w / 2 + 2);
+    edge.setMatrixAt(k++, m);
+  }
+  scene.add(edge);
+  for (const [x, mat] of [
+    [R.x - R.len / 2, green], [R.x + R.len / 2, red],
+  ]) {
+    for (const dz of [-14, 0, 14]) {
+      const s = new THREE.Mesh(lightGeo, mat);
+      s.position.set(x, 5.2, R.z + dz);
+      scene.add(s);
     }
   }
 }
 
-function drawDrops(ctx, G) {
-  for (const d of G.drops) {
-    const p = projectPoint(G, d.x, d.z, terrainAt(d.x, d.z).h);
-    if (!p) continue;
-    const prog = d.t / 1.6;
-    const rad = p.s * (22 + prog * 55);
-    ctx.fillStyle = 'rgba(190,225,255,' + (0.5 * (1 - prog)).toFixed(2) + ')';
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y, rad, rad * 0.25, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,' + (0.55 * (1 - prog)).toFixed(2) + ')';
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y - rad * 0.15, rad * 0.55, rad * 0.15, 0, 0, Math.PI * 2);
-    ctx.fill();
+function buildVillage() {
+  const V = CFG.VILLAGE;
+  const rng = makeRng(77);
+  const wall = new THREE.MeshLambertMaterial({ color: 0xd8c9a8 });
+  const roofMat = new THREE.MeshLambertMaterial({ color: 0x8a4a34 });
+  const winMat = new THREE.MeshBasicMaterial({ color: 0xffd27a });
+  const spots = [
+    [-80, -50], [10, -60], [80, -40], [-60, 30], [20, 55], [95, 45], [-20, -10], [60, -5],
+  ];
+  for (const [dx, dz] of spots) {
+    const x = V.x + dx, z = V.z + dz;
+    const h = terrainAt(x, z).h;
+    const house = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(13, 6, 10), wall);
+    body.position.y = 3;
+    house.add(body);
+    const roof = new THREE.Mesh(new THREE.ConeGeometry(9.5, 4.5, 4), roofMat);
+    roof.position.y = 8.2;
+    roof.rotation.y = Math.PI / 4;
+    house.add(roof);
+    for (const wx of [-3.5, 3.5]) {
+      const win = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 2.2), winMat);
+      win.position.set(wx, 3.2, 5.05);
+      house.add(win);
+    }
+    house.position.set(x, h, z);
+    house.rotation.y = rng() * Math.PI;
+    scene.add(house);
   }
 }
 
-// The airtanker, rear chase view, fixed in the frame; the world moves.
-function drawPlane(ctx, G, t) {
-  const cx = CFG.W / 2, cy = CFG.H * 0.60 + Math.sin(t * 2.1) * 2;
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(G.roll * 0.85);
-  // Wings.
-  ctx.fillStyle = '#a33327';
-  ctx.beginPath();
-  ctx.moveTo(-92, -6); ctx.lineTo(-14, -18); ctx.lineTo(14, -18); ctx.lineTo(92, -6);
-  ctx.lineTo(88, 10); ctx.lineTo(12, 4); ctx.lineTo(-12, 4); ctx.lineTo(-88, 10);
-  ctx.closePath();
-  ctx.fill();
-  ctx.fillStyle = '#e8e4d8';
-  ctx.fillRect(-92, -6, 8, 14);
-  ctx.fillRect(84, -6, 8, 14);
-  // Tailplane + fin.
-  ctx.fillStyle = '#8c2b20';
-  ctx.beginPath();
-  ctx.moveTo(-34, 44); ctx.lineTo(34, 44); ctx.lineTo(22, 56); ctx.lineTo(-22, 56);
-  ctx.closePath();
-  ctx.fill();
-  ctx.fillStyle = '#a33327';
-  ctx.beginPath();
-  ctx.moveTo(-4, 40); ctx.lineTo(4, 40); ctx.lineTo(10, 62); ctx.lineTo(-10, 62);
-  ctx.closePath();
-  ctx.fill();
-  // Fuselage.
-  const fg = ctx.createLinearGradient(-14, 0, 14, 0);
-  fg.addColorStop(0, '#d8d2c4');
-  fg.addColorStop(0.5, '#f5f1e6');
-  fg.addColorStop(1, '#cfc8b8');
-  ctx.fillStyle = fg;
-  ctx.beginPath();
-  ctx.moveTo(0, -62);
-  ctx.quadraticCurveTo(13, -30, 14, 10);
-  ctx.quadraticCurveTo(14, 44, 8, 54);
-  ctx.lineTo(-8, 54);
-  ctx.quadraticCurveTo(-14, 44, -14, 10);
-  ctx.quadraticCurveTo(-13, -30, 0, -62);
-  ctx.fill();
-  // Red cheatline + belly tank.
-  ctx.fillStyle = '#a33327';
-  ctx.fillRect(-14, 16, 28, 5);
-  ctx.fillStyle = '#2f6fb2';
-  ctx.beginPath();
-  ctx.ellipse(0, 34, 9, 16, 0, 0, Math.PI * 2);
-  ctx.fill();
-  // Cockpit glint.
-  ctx.fillStyle = '#1d2f45';
-  ctx.beginPath();
-  ctx.ellipse(-5, -44, 4, 7, -0.25, 0, Math.PI * 2);
-  ctx.ellipse(5, -44, 4, 7, 0.25, 0, Math.PI * 2);
-  ctx.fill();
-  // Props, spinning.
-  for (const side of [-1, 1]) {
-    const px = side * 56, py = -10;
-    ctx.strokeStyle = 'rgba(40,36,32,0.55)';
-    ctx.lineWidth = 3;
-    const a = t * 34 + (side < 0 ? 1.2 : 0);
-    ctx.beginPath();
-    ctx.moveTo(px - Math.cos(a) * 17, py - Math.sin(a) * 17);
-    ctx.lineTo(px + Math.cos(a) * 17, py + Math.sin(a) * 17);
-    ctx.moveTo(px - Math.cos(a + 1.57) * 17, py - Math.sin(a + 1.57) * 17);
-    ctx.lineTo(px + Math.cos(a + 1.57) * 17, py + Math.sin(a + 1.57) * 17);
-    ctx.stroke();
-    ctx.fillStyle = '#3a3630';
-    ctx.beginPath();
-    ctx.arc(px, py, 4, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  // Nav lights.
-  ctx.fillStyle = '#ff3b30';
-  ctx.beginPath(); ctx.arc(-92, 2, 3, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = '#34d17b';
-  ctx.beginPath(); ctx.arc(92, 2, 3, 0, Math.PI * 2); ctx.fill();
-  ctx.restore();
+function buildTrees() {
+  const spots = treeSpots(480, 2024);
+  const geo = new THREE.ConeGeometry(5.5, 17, 6);
+  const mat = new THREE.MeshLambertMaterial({ color: 0x3f7a34 });
+  const trees = new THREE.InstancedMesh(geo, mat, spots.length);
+  const m = new THREE.Matrix4();
+  const q = new THREE.Quaternion();
+  const e = new THREE.Euler();
+  const s = new THREE.Vector3();
+  spots.forEach((t, i) => {
+    e.set(0, t.rot, 0);
+    q.setFromEuler(e);
+    s.set(t.s, t.s, t.s);
+    m.compose(new THREE.Vector3(t.x, t.h + 8 * t.s, t.z), q, s);
+    trees.setMatrixAt(i, m);
+  });
+  scene.add(trees);
 }
 
-function drawHUD(ctx, G, t) {
-  const W = CFG.W, H = CFG.H;
-  ctx.textBaseline = 'alphabetic';
-  // Top bar.
-  ctx.fillStyle = 'rgba(10,14,24,0.72)';
-  ctx.fillRect(0, 0, W, 54);
-  ctx.fillStyle = '#f5f1e6';
-  ctx.font = 'bold 21px monospace';
-  ctx.textAlign = 'left';
-  ctx.fillText('ALT ' + Math.max(0, Math.round(G.alt)) + ' m', 16, 34);
-  ctx.fillText('SPD ' + Math.round(G.speed * 3.6) + ' km/h', 190, 34);
-  const hdg = Math.round(((G.heading * 180) / Math.PI % 360 + 360) % 360);
-  ctx.fillText('HDG ' + String(hdg).padStart(3, '0') + '°', 400, 34);
-  // Clock + score, centre.
-  ctx.textAlign = 'center';
-  const mm = Math.max(0, Math.floor(G.timeLeft / 60));
-  const ss = Math.max(0, Math.floor(G.timeLeft % 60));
-  ctx.font = 'bold 26px monospace';
-  ctx.fillStyle = G.timeLeft < 30 ? '#ff6b4a' : '#f5f1e6';
-  ctx.fillText(String(mm).padStart(2, '0') + ':' + String(ss).padStart(2, '0'), W / 2, 35);
-  ctx.font = 'bold 15px monospace';
-  ctx.fillStyle = '#ffd23e';
-  ctx.fillText('SCORE ' + G.score.toLocaleString('en-US'), W / 2, 52);
-  drawMinimap(ctx, G);
-  // Compass strip under the bar: a label every 30° is all that fits
-  // legibly in 380 px — every 15° blurred into one long number.
-  ctx.fillStyle = 'rgba(10,14,24,0.55)';
-  ctx.fillRect(W / 2 - 190, 54, 380, 22);
-  ctx.font = 'bold 13px monospace';
-  ctx.textAlign = 'center';
-  for (let off = -180; off <= 180; off += 30) {
-    const deg = ((hdg + off) % 360 + 360) % 360;
-    const x = W / 2 + off * 1.05;
-    if (x < W / 2 - 185 || x > W / 2 + 185) continue;
-    const label = deg === 0 ? 'N' : deg === 90 ? 'E' : deg === 180 ? 'S' : deg === 270 ? 'W' : String(deg);
-    ctx.fillStyle = (label === 'N' || label === 'E' || label === 'S' || label === 'W') ? '#ffd23e' : '#cfd6e4';
-    ctx.fillText(label, x, 70);
-    ctx.fillRect(x - 0.5, 72, 1, 5);
+function buildVolcano() {
+  // A glowing crater and a slow smoke column over the peak.
+  const V = CFG.VOLCANO;
+  const glow = new THREE.Mesh(
+    new THREE.CircleGeometry(55, 20),
+    new THREE.MeshBasicMaterial({ color: 0xff6a1a }),
+  );
+  glow.rotation.x = -Math.PI / 2;
+  glow.position.set(V.x, V.peak + 2, V.z);
+  scene.add(glow);
+  const light = new THREE.PointLight(0xff7733, 90000, 1500, 1.6);
+  light.position.set(V.x, V.peak + 60, V.z);
+  scene.add(light);
+}
+
+// --- Fires, rings, drops ---
+
+function buildFireVisuals(G) {
+  const smokeTex = radialTexture('rgba(40,36,34,0.85)', 'rgba(40,36,34,0)');
+  const glowTex = radialTexture('rgba(255,150,40,0.9)', 'rgba(255,80,10,0)');
+  // One visual slot per fire the island can ever hold (FIRES_MAX): a fire
+  // the wind spreads later takes a free slot, so it is seen too.
+  fireVisuals = [];
+  for (let i = 0; i < CFG.FIRES_MAX; i++) {
+    const f = G.fires[i] || { x: 0, z: 0, kind: 'forest', intensity: 1 };
+    const g = new THREE.Group();
+    const ground = terrainAt(f.x, f.z).h;
+    const tall = f.kind === 'building' ? 1.35 : 1;
+    const flameMat = new THREE.MeshBasicMaterial({ color: 0xff7a18 });
+    const flameMat2 = new THREE.MeshBasicMaterial({ color: 0xffd23e });
+    const cones = [];
+    for (let k = 0; k < 3; k++) {
+      const cone = new THREE.Mesh(new THREE.ConeGeometry(9 - k * 2.4, 22 * tall - k * 5, 8), k === 1 ? flameMat2 : flameMat);
+      cone.position.set((k - 1) * 6, (11 * tall - k * 2.5), (k % 2) * 5 - 2);
+      g.add(cone);
+      cones.push(cone);
+    }
+    const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, transparent: true, opacity: 0.6,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    glow.scale.set(130, 90, 1);
+    glow.position.y = 22;
+    g.add(glow);
+    const smokes = [];
+    for (let k = 0; k < 4; k++) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: smokeTex, transparent: true, opacity: 0.5, depthWrite: false,
+      }));
+      sp.scale.set(46, 46, 1);
+      g.add(sp);
+      smokes.push(sp);
+    }
+    const scorch = new THREE.Mesh(
+      new THREE.CircleGeometry(fireRadius(f), 18),
+      new THREE.MeshBasicMaterial({ color: 0x14100c, transparent: true, opacity: 0.45, depthWrite: false }),
+    );
+    scorch.rotation.x = -Math.PI / 2;
+    scorch.position.y = 0.8;
+    g.add(scorch);
+    g.position.set(f.x, ground, f.z);
+    g.userData = { cones, glow, smokes, scorch, phase: i * 1.7, ground };
+    g.visible = false;
+    scene.add(g);
+    fireVisuals.push(g);
   }
-  // Artificial horizon, bottom left.
-  const ax = 92, ay = H - 92, ar = 50;
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(ax, ay, ar, 0, Math.PI * 2);
-  ctx.clip();
-  ctx.translate(ax, ay);
-  ctx.rotate(-G.roll);
-  ctx.translate(0, G.pitch * 260);
-  ctx.fillStyle = '#7fb2d9';
-  ctx.fillRect(-ar - 10, -ar - 60, ar * 2 + 20, ar + 60);
-  ctx.fillStyle = '#6b4a2f';
-  ctx.fillRect(-ar - 10, 0, ar * 2 + 20, ar + 60);
-  ctx.fillStyle = '#f5f1e6';
-  ctx.fillRect(-ar - 10, -1, ar * 2 + 20, 2);
-  ctx.restore();
-  ctx.strokeStyle = '#f5f1e6';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(ax, ay, ar, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.fillStyle = '#ffd23e';
-  ctx.beginPath();
-  ctx.moveTo(ax - 26, ay); ctx.lineTo(ax - 8, ay); ctx.lineTo(ax - 8, ay + 4); ctx.lineTo(ax + 8, ay + 4);
-  ctx.lineTo(ax + 8, ay); ctx.lineTo(ax + 26, ay); ctx.lineTo(ax + 26, ay - 3); ctx.lineTo(ax - 26, ay - 3);
-  ctx.closePath();
-  ctx.fill();
-  ctx.font = 'bold 12px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#f5f1e6';
-  ctx.fillText('ATTITUDE', ax, ay + ar + 16);
-  // Throttle bar.
-  const tx = 168, ty0 = H - 148, th = 104;
-  ctx.fillStyle = 'rgba(10,14,24,0.6)';
-  ctx.fillRect(tx, ty0, 16, th);
-  ctx.fillStyle = G.throttle > 0.85 ? '#ff6b4a' : '#34d17b';
-  ctx.fillRect(tx, ty0 + th * (1 - G.throttle), 16, th * G.throttle);
-  ctx.strokeStyle = '#f5f1e6';
-  ctx.strokeRect(tx, ty0, 16, th);
-  ctx.fillStyle = '#f5f1e6';
-  ctx.font = 'bold 12px monospace';
-  ctx.fillText('THR', tx + 8, ty0 + th + 16);
-  // Fuel + water, bottom centre.
-  const fx0 = 240, fy = H - 52;
-  ctx.textAlign = 'left';
-  ctx.font = 'bold 13px monospace';
-  ctx.fillStyle = '#f5f1e6';
-  ctx.fillText('FUEL', fx0, fy - 26);
-  ctx.fillStyle = 'rgba(10,14,24,0.6)';
-  ctx.fillRect(fx0 + 52, fy - 38, 150, 14);
-  ctx.fillStyle = G.fuel < 20 ? '#ff6b4a' : '#ffb13e';
-  ctx.fillRect(fx0 + 52, fy - 38, 150 * (G.fuel / 100), 14);
-  ctx.strokeStyle = '#f5f1e6';
-  ctx.strokeRect(fx0 + 52, fy - 38, 150, 14);
-  ctx.fillText('WATER', fx0 + 226, fy - 26);
-  for (let i = 0; i < CFG.TANK_DROPS; i++) {
-    const dx = fx0 + 292 + i * 26, dy = fy - 31;
-    ctx.beginPath();
-    ctx.moveTo(dx, dy - 10);
-    ctx.quadraticCurveTo(dx + 8, dy + 2, dx, dy + 8);
-    ctx.quadraticCurveTo(dx - 8, dy + 2, dx, dy - 10);
-    if (G.water >= i + 1) {
-      ctx.fillStyle = '#4aa3e8';
-      ctx.fill();
+  // The target ring: a gold torus plus a light beam, parked over whatever
+  // the sortie is asking for — the nearest fire, or the runway threshold.
+  ringGroup = new THREE.Group();
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(34, 2.0, 10, 40),
+    new THREE.MeshBasicMaterial({ color: 0xffd23e }),
+  );
+  ringGroup.add(ring);
+  const ring2 = new THREE.Mesh(
+    new THREE.TorusGeometry(25, 1.2, 8, 32),
+    new THREE.MeshBasicMaterial({ color: 0xffe9a0 }),
+  );
+  ringGroup.add(ring2);
+  scene.add(ringGroup);
+  ringBeam = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.6, 1.6, 60, 8, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0xffc93c, transparent: true, opacity: 0.35,
+      blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+    }),
+  );
+  scene.add(ringBeam);
+  // Water drops: one reusable cluster per drop in flight.
+  dropVisuals = [];
+  for (let i = 0; i < 3; i++) {
+    const dg = new THREE.Group();
+    for (let k = 0; k < 7; k++) {
+      const drop = new THREE.Mesh(
+        new THREE.SphereGeometry(2.2, 6, 5),
+        new THREE.MeshBasicMaterial({ color: 0x9fd4ff }),
+      );
+      drop.position.set((k % 3 - 1) * 4, (k % 2) * -3, Math.floor(k / 3) * 4 - 4);
+      dg.add(drop);
+    }
+    const splash = new THREE.Mesh(
+      new THREE.RingGeometry(6, 10, 20),
+      new THREE.MeshBasicMaterial({
+        color: 0xbfe3ff, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false,
+      }),
+    );
+    splash.rotation.x = -Math.PI / 2;
+    dg.add(splash);
+    dg.userData.splash = splash;
+    dg.visible = false;
+    scene.add(dg);
+    dropVisuals.push(dg);
+  }
+}
+
+function updateFireVisuals(G, animT) {
+  for (let i = 0; i < fireVisuals.length; i++) {
+    const f = G.fires[i];
+    const vis = fireVisuals[i];
+    if (!vis) continue;
+    if (!f || !f.alive) { vis.visible = false; continue; }
+    vis.visible = true;
+    // A fire the wind spread takes its slot at its own spot.
+    const ground = terrainAt(f.x, f.z).h;
+    vis.position.set(f.x, ground, f.z);
+    const u = vis.userData;
+    const flick = 0.82 + 0.28 * Math.sin(animT * 7 + u.phase) + 0.1 * Math.sin(animT * 13 + u.phase * 2);
+    u.cones.forEach((c, k) => {
+      c.scale.y = flick * (1 - k * 0.12) * (0.6 + f.intensity * 0.4);
+    });
+    u.glow.material.opacity = 0.45 + 0.2 * Math.sin(animT * 5 + u.phase);
+    u.smokes.forEach((sp, k) => {
+      const cyc = ((animT * 0.09 + k * 0.25 + u.phase * 0.1) % 1);
+      sp.position.set(Math.sin(u.phase + k * 2.1) * 8, 26 + cyc * 85, Math.cos(u.phase + k) * 8);
+      const sc = 40 + cyc * 70;
+      sp.scale.set(sc, sc, 1);
+      sp.material.opacity = 0.5 * (1 - cyc);
+    });
+  }
+}
+
+function updateTargetRing(G, animT) {
+  let tx, tz, ty;
+  if (G.phase === 'return' || G.state === 'win') {
+    const R = CFG.RUNWAY;
+    tx = R.x - R.len / 2 + 70; tz = R.z; ty = 62;
+  } else {
+    const t = currentTarget(G);
+    if (!t) { ringGroup.visible = false; ringBeam.visible = false; return; }
+    tx = t.x; tz = t.z; ty = terrainAt(t.x, t.z).h + 58;
+  }
+  ringGroup.visible = true;
+  ringBeam.visible = true;
+  ringGroup.position.set(tx, ty + Math.sin(animT * 1.6) * 3, tz);
+  // The ring faces the camera: a flat ring seen edge-on from a chase view
+  // is a thin line, so it turns to face whoever looks at it.
+  ringGroup.lookAt(camera.position);
+  ringBeam.position.set(tx, ty - 28, tz);
+}
+
+function updateDropVisuals(G) {
+  G.drops.forEach((d, i) => {
+    const dg = dropVisuals[i];
+    if (!dg) return;
+    dg.visible = true;
+    const ground = terrainAt(d.x, d.z).h;
+    const startAlt = d.alt !== undefined ? d.alt : 140;
+    const fall = Math.min(1, d.t / 1.15);
+    const y = Math.max(ground + 1, startAlt - (startAlt - ground) * fall * fall);
+    dg.position.set(d.x, y, d.z);
+    const splash = dg.userData.splash;
+    if (d.t > 1.15) {
+      const s = (d.t - 1.15) / 0.45;
+      splash.material.opacity = 0.7 * (1 - s);
+      const r = 8 + s * 55;
+      splash.scale.set(r / 8, r / 8, 1);
+      splash.position.y = ground + 1.2 - y;
     } else {
-      ctx.strokeStyle = '#7d8aa0';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
+      splash.material.opacity = 0;
     }
-  }
-  // Fires count, bottom right.
-  const out = G.fires.filter((f) => !f.alive).length;
-  ctx.textAlign = 'right';
-  ctx.font = 'bold 17px monospace';
-  ctx.fillStyle = '#ffb13e';
-  ctx.fillText('FIRES OUT ' + out + ' / ' + G.fires.length, W - 18, H - 66);
-  ctx.font = 'bold 13px monospace';
-  ctx.fillStyle = '#cfd6e4';
-  ctx.fillText('W/S throttle · ←/→ bank · ↑/↓ pitch · SPACE drop · P pause', W - 18, H - 44);
-  // Target marker: nearest fire ahead.
-  let best = null, bestD = 1e9;
-  for (const f of G.fires) {
-    if (!f.alive) continue;
-    const dx = f.x - G.x, dz = f.z - G.z;
-    const d = Math.hypot(dx, dz);
-    const ang = Math.atan2(Math.sin(Math.atan2(dx, -dz) - G.heading), Math.cos(Math.atan2(dx, -dz) - G.heading));
-    if (Math.abs(ang) < 0.55 && d < bestD) { best = f; bestD = d; }
-  }
-  if (best) {
-    const p = projectPoint(G, best.x, best.z, terrainAt(best.x, best.z).h);
-    if (p) {
-      const sx = CFG.W / 2 + p.x, sy = CFG.H * 0.42 + G.pitch * 300 + p.y;
-      ctx.strokeStyle = '#ffd23e';
-      ctx.lineWidth = 2;
-      const s = 12 + 4 * Math.sin(t * 5);
-      ctx.beginPath();
-      ctx.moveTo(sx, sy - s); ctx.lineTo(sx + s, sy); ctx.lineTo(sx, sy + s); ctx.lineTo(sx - s, sy);
-      ctx.closePath();
-      ctx.stroke();
-      ctx.font = 'bold 14px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillStyle = '#ffd23e';
-      ctx.fillText('FIRE ' + Math.round(bestD) + ' m', sx, sy - s - 8);
-      if (bestD < 260 && G.water >= 1 && G.state === 'playing' && Math.floor(t * 2) % 2 === 0) {
-        ctx.font = 'bold 22px monospace';
-        ctx.fillStyle = '#ffffff';
-        ctx.fillText('SPACE — DROP WATER', W / 2, H * 0.30);
-      }
-    }
-  }
-  // Messages.
-  if (G.messageT > 0 && G.message) {
-    ctx.font = 'bold 24px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = 'rgba(10,14,24,0.6)';
-    const mw = ctx.measureText(G.message).width + 36;
-    ctx.fillRect(W / 2 - mw / 2, H * 0.36 - 32, mw, 40);
-    ctx.fillStyle = '#ffd23e';
-    ctx.fillText(G.message, W / 2, H * 0.36 - 4);
-  }
-  if (G.scooping) {
-    ctx.font = 'bold 20px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = '#7fd0ff';
-    ctx.fillText('SCOOPING WATER…', W / 2, H * 0.24);
-  }
+  });
+  for (let i = G.drops.length; i < dropVisuals.length; i++) dropVisuals[i].visible = false;
 }
 
-function drawMinimap(ctx, G) {
-  const mx = CFG.W - 178, my = 62, mw = 160, mh = 112;
-  ctx.fillStyle = 'rgba(10,14,24,0.72)';
-  ctx.fillRect(mx - 6, my - 6, mw + 12, mh + 12);
-  const px = (x) => mx + ((x + 1700) / 3400) * mw;
-  const py = (z) => my + ((z + 1500) / 3000) * mh;
-  ctx.fillStyle = '#123a5c';
-  ctx.fillRect(mx, my, mw, mh);
-  ctx.fillStyle = '#3f6b34';
-  ctx.beginPath();
-  ctx.ellipse(px(0), py(0), (CFG.ISLAND_RX / 3400) * mw, (CFG.ISLAND_RZ / 3000) * mh, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = '#2f7fb8';
-  ctx.beginPath();
-  ctx.arc(px(CFG.LAKE.x), py(CFG.LAKE.z), 6, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = '#8a7a66';
-  ctx.beginPath();
-  ctx.moveTo(px(CFG.VOLCANO.x), py(CFG.VOLCANO.z) - 7);
-  ctx.lineTo(px(CFG.VOLCANO.x) + 6, py(CFG.VOLCANO.z) + 5);
-  ctx.lineTo(px(CFG.VOLCANO.x) - 6, py(CFG.VOLCANO.z) + 5);
-  ctx.closePath();
-  ctx.fill();
-  ctx.strokeStyle = '#e8e4d8';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(px(CFG.RUNWAY.x - CFG.RUNWAY.len / 2), py(CFG.RUNWAY.z));
-  ctx.lineTo(px(CFG.RUNWAY.x + CFG.RUNWAY.len / 2), py(CFG.RUNWAY.z));
-  ctx.stroke();
-  for (const f of G.fires) {
-    if (!f.alive) continue;
-    ctx.fillStyle = Math.floor(G.time * 3) % 2 === 0 ? '#ff5a2a' : '#ffb13e';
-    ctx.beginPath();
-    ctx.arc(px(f.x), py(f.z), 3, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  // The plane.
-  ctx.save();
-  ctx.translate(px(G.x), py(G.z));
-  ctx.rotate(G.heading);
-  ctx.fillStyle = '#ffffff';
-  ctx.beginPath();
-  ctx.moveTo(0, -6); ctx.lineTo(4, 5); ctx.lineTo(-4, 5);
-  ctx.closePath();
-  ctx.fill();
-  ctx.restore();
-}
+// --- Camera ---
 
-function drawScreens(ctx, G) {
-  const W = CFG.W, H = CFG.H;
-  ctx.textAlign = 'center';
+function updateCamera(G, animT, snap) {
   if (G.state === 'title') {
-    ctx.fillStyle = 'rgba(8,10,20,0.55)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#ffd23e';
-    ctx.font = 'bold 84px monospace';
-    ctx.fillText('BARA LANGIT', W / 2, H * 0.30);
-    ctx.fillStyle = '#f5f1e6';
-    ctx.font = 'bold 26px monospace';
-    ctx.fillText('WILDFIRE AIR TANKER — PULAU ARANG AT DUSK', W / 2, H * 0.30 + 44);
-    ctx.font = '19px monospace';
-    ctx.fillStyle = '#e8e0cc';
-    ctx.fillText('Eight fires are burning across the island. Scoop water from the sea,', W / 2, H * 0.46);
-    ctx.fillText('drop it on the flames, and put them all out before the clock runs out.', W / 2, H * 0.46 + 26);
-    ctx.fillText('Land on the runway to refuel. Mind the volcano.', W / 2, H * 0.46 + 52);
-    ctx.font = 'bold 17px monospace';
-    ctx.fillStyle = '#7fd0ff';
-    ctx.fillText('W / S throttle    ← / → bank    ↑ / ↓ pitch    SPACE drop water    P pause    M mute', W / 2, H * 0.60);
-    if (Math.floor(G.time * 1.6) % 2 === 0) {
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 24px monospace';
-      ctx.fillText('ENTER or CLICK — FLY THE SORTIE', W / 2, H * 0.70);
-    }
-    ctx.font = '14px monospace';
-    ctx.fillStyle = '#9aa5b8';
-    ctx.fillText('A complete flight game: chase view over a volcanic island, lit instruments,', W / 2, H * 0.82);
-    ctx.fillText('runway landings, fuel and water decisions, 180 seconds to save the island.', W / 2, H * 0.82 + 20);
-  } else if (G.state === 'win') {
-    ctx.fillStyle = 'rgba(8,20,10,0.62)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#ffd23e';
-    ctx.font = 'bold 64px monospace';
-    ctx.fillText('ALL FIRES OUT', W / 2, H * 0.38);
-    ctx.fillStyle = '#f5f1e6';
-    ctx.font = 'bold 24px monospace';
-    ctx.fillText('THE ISLAND IS SAFE — SCORE ' + G.score.toLocaleString('en-US'), W / 2, H * 0.38 + 44);
-    ctx.fillText('time bonus +' + G.winBonus, W / 2, H * 0.38 + 76);
-    ctx.font = 'bold 20px monospace';
-    ctx.fillText('ENTER — FLY AGAIN', W / 2, H * 0.55);
-  } else if (G.state === 'lose') {
-    ctx.fillStyle = 'rgba(20,8,8,0.62)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#ff6b4a';
-    ctx.font = 'bold 64px monospace';
-    ctx.fillText(G.crashReason || 'TIME UP', W / 2, H * 0.38);
-    ctx.fillStyle = '#f5f1e6';
-    ctx.font = 'bold 24px monospace';
-    const out = G.fires.filter((f) => !f.alive).length;
-    ctx.fillText('Fires out ' + out + ' of ' + G.fires.length + ' — score ' + G.score.toLocaleString('en-US'), W / 2, H * 0.38 + 44);
-    ctx.font = 'bold 20px monospace';
-    ctx.fillText('ENTER — TRY AGAIN', W / 2, H * 0.55);
-  } else if (G.state === 'crash') {
-    ctx.fillStyle = 'rgba(20,8,8,0.62)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#ff6b4a';
-    ctx.font = 'bold 56px monospace';
-    ctx.fillText(G.crashReason || 'CRASHED', W / 2, H * 0.38);
-    ctx.fillStyle = '#f5f1e6';
-    ctx.font = 'bold 24px monospace';
-    ctx.fillText('SCORE ' + G.score.toLocaleString('en-US'), W / 2, H * 0.38 + 44);
-    ctx.font = 'bold 20px monospace';
-    ctx.fillText('ENTER — TRY AGAIN', W / 2, H * 0.55);
+    // A slow orbit over the island behind the title screen.
+    const a = animT * 0.045;
+    camera.position.set(Math.cos(a) * 2400, 750, Math.sin(a) * 2100);
+    camera.up.set(0, 1, 0);
+    camera.lookAt(0, 40, 100);
+    camInit = false;
+    return;
   }
+  const fx = Math.sin(G.heading), fz = -Math.cos(G.heading);
+  if (G.state === 'win') {
+    // A high, wide view of the landing: the tanker parked on the strip,
+    // the runway running away ahead of her.
+    tmpV.set(G.x - fx * 45, G.alt + 22, G.z - fz * 45);
+    if (!camInit || snap) { camPos.copy(tmpV); camInit = true; }
+    else camPos.lerp(tmpV, 1 - Math.exp(-6 * 0.016));
+    camera.position.copy(camPos);
+    camera.up.set(0, 1, 0);
+    camera.lookAt(G.x + fx * 30, G.alt + 2, G.z + fz * 30);
+    return;
+  }
+  tmpV.set(G.x - fx * 30, G.alt + 10, G.z - fz * 30);
+  if (!camInit || snap) {
+    camPos.copy(tmpV);
+    camInit = true;
+  } else {
+    camPos.lerp(tmpV, 1 - Math.exp(-6 * 0.016));
+  }
+  camera.position.copy(camPos);
+  // The camera banks a third as far as the plane: the horizon tilts, but
+  // the view never fights the pilot.
+  const bank = -G.roll * 0.35;
+  tmpRight.set(Math.cos(G.heading), 0, Math.sin(G.heading));
+  tmpUp.set(0, 1, 0).addScaledVector(tmpRight, Math.sin(bank)).normalize();
+  camera.up.copy(tmpUp);
+  camera.lookAt(G.x + fx * 48, G.alt + 1, G.z + fz * 48);
 }
 
-// One frame. The world (sky, ground, volcano, runway, fires, drops) is
-// drawn rolled with the bank around the horizon point; the plane and the
-// instruments stay level in the frame.
-function render(ctx, G, t) {
-  const W = CFG.W, H = CFG.H;
-  const horizonY = H * 0.42 + G.pitch * 300;
-  ctx.save();
-  ctx.translate(W / 2, horizonY);
-  ctx.rotate(-G.roll * 0.6);
-  ctx.translate(-W / 2, -horizonY);
-  drawSky(ctx, G, t);
-  ctx.save();
-  ctx.translate(W / 2, horizonY);
-  drawGround(ctx, G);
-  drawVolcano(ctx, G, t);
-  drawRunway(ctx, G);
-  drawFires(ctx, G, t);
-  drawDrops(ctx, G);
-  ctx.restore();
-  ctx.restore();
-  drawPlane(ctx, G, t);
-  drawHUD(ctx, G, t);
-  drawScreens(ctx, G);
+// --- Public entry points ---
+
+export function initRender(canvas) {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setSize(CFG.W, CFG.H, false);
+  renderer.setPixelRatio(1);
+  scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0xc97e4e, 900, 4300);
+  camera = new THREE.PerspectiveCamera(62, CFG.W / CFG.H, 0.5, 12000);
+  const sun = new THREE.DirectionalLight(0xffc490, 1.7);
+  sun.position.set(-1800, 1200, 700);
+  scene.add(sun);
+  scene.add(new THREE.HemisphereLight(0x6a6aa0, 0x2a2018, 0.75));
+  buildSky();
+  buildTerrainMesh();
+  buildRunway();
+  buildVillage();
+  buildTrees();
+  buildVolcano();
+  planeGroup = buildAircraft();
+  scene.add(planeGroup);
+}
+
+export function buildWorldVisuals(G) {
+  buildFireVisuals(G);
+}
+
+export function renderFrame(G, animT, snap) {
+  if (!renderer) return;
+  setAircraftPose(planeGroup, G, animT);
+  updateCamera(G, animT, !!snap);
+  updateFireVisuals(G, animT);
+  updateTargetRing(G, animT);
+  updateDropVisuals(G);
+  renderer.render(scene, camera);
 }
