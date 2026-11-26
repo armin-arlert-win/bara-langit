@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BARA LANGIT — Wildfire Air Tanker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0e18; height: 100%; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { width: min(100vw, 160vh); height: auto; display: block; background: #141d38; }
+  #test-results { display: none; position: fixed; left: 0; top: 0; color: #fff;
+    font: 14px monospace; white-space: pre; background: #000; padding: 8px; z-index: 9; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="800"></canvas>
+<div id="test-results"></div>
+<script src="src/config.js"></script>
+<script src="src/random.js"></script>
+<script src="src/terrain.js"></script>
+<script src="src/input.js"></script>
+<script src="src/audio.js"></script>
+<script src="src/world.js"></script>
+<script src="src/render.js"></script>
+<script src="src/shots.js"></script>
+<script src="src/main.js"></script>
+</body>
+</html>
