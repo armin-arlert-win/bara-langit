@@ -1,284 +1,235 @@
-// world.js: the sortie itself — physics, wind, fires, water, fuel,
-// scoring, and every way a flight ends. No drawing here, no DOM here.
-// The mission has two kinds of target and a finale: put out every fire,
-// then bring her home with a precision landing on the runway.
-
-import { CFG } from './config.js';
-import { terrainAt, islandR, forestFireSpots, buildingFireSpots } from './terrain.js';
-import { KEYS } from './input.js';
-import {
-  soundDrop, soundFireOut, soundAlarm, soundWin, soundCrash, soundScoop,
-} from './audio.js';
-
-export function newGame() {
-  const spots = forestFireSpots(CFG.SEED);
-  const buildings = buildingFireSpots();
-  const fires = spots.map((s, i) => ({
-    x: s.x, z: s.z, kind: 'forest',
-    intensity: 0.7 + (i % 3) * 0.15, alive: true, spreadIn: 30 + (i * 7) % 25,
-  }));
-  for (const b of buildings) {
-    fires.push({
-      x: b.x, z: b.z, kind: 'building',
-      intensity: 1.1, alive: true, spreadIn: 9999,
-    });
+// BARA LANGIT v3 — the sortie itself. One job: physics, fires, water, fuel,
+// three visible phases, scoring, endings. No drawing here; render.js reads this.
+const World = (() => {
+  const C = CFG;
+  const D2R = Math.PI / 180;
+  function freshState() {
+    return {
+      mode: 'title', // title | fly | win | lose | crash
+      phase: 1, // 1 forest fires, 2 town fires, 3 precision landing
+      t: 0, timeLeft: C.clockStart,
+      x: C.runway.x - C.runway.len / 2 + 60, z: C.runway.z,
+      alt: 2, hdg: 90, speed: 0, pitch: 0, bank: 0, throttle: 0,
+      fuel: C.fuelMax, water: C.waterMax,
+      score: 0, firesOut: 0, townOut: 0,
+      fires: Terrain.fireSpots(),
+      spares: Terrain.spreadSpots(),
+      spreadTimer: C.spreadEvery,
+      drops: [], splash: null,
+      message: '', messageT: 0,
+      landBonus: 0, timeBonus: 0,
+      endReason: '', endDetail: '',
+      airborne: false, landed: false,
+      windGust: 0,
+      stats: { drops: 0, scoops: 0, refuels: 0 },
+    };
   }
-  return {
-    state: 'title', // title | playing | return | win | lose | crash
-    phase: 'fires', // fires | return — what the sortie is asking for now
-    time: 0,
-    timeLeft: CFG.TIME_LIMIT,
-    score: 0,
-    // The airtanker, parked on the runway facing east, engine off.
-    x: CFG.RUNWAY.x - 250, z: CFG.RUNWAY.z,
-    alt: 5, heading: Math.PI / 2, speed: 0,
-    pitch: 0, roll: 0, throttle: 0,
-    fuel: 100, water: CFG.TANK_DROPS,
-    fires,
-    drops: [], // water bursts falling to the ground
-    message: '', messageT: 0,
-    landed: false, scooping: false,
-    crashReason: '', winBonus: 0, landingBonus: 0,
-    _fuelWarned: false, _lowWarned: false, _scoopSaid: false,
-  };
-}
-
-export function say(G, text, seconds) {
-  G.message = text;
-  G.messageT = seconds || 3;
-}
-
-export function fireRadius(f) {
-  return 16 + f.intensity * 24;
-}
-
-// The wind now: steady from the west plus a slow deterministic gust.
-export function windNow(t) {
-  const gust = Math.sin(t * (Math.PI * 2 / CFG.WIND.gustPeriod)) * CFG.WIND.gust;
-  return { x: CFG.WIND.x + gust, z: CFG.WIND.z };
-}
-
-// Where a drop lands: ahead of the nose, further the higher she flies.
-export function dropPoint(G) {
-  const fx = Math.sin(G.heading), fz = -Math.cos(G.heading);
-  const ahead = 90 + G.alt * 0.55;
-  return { x: G.x + fx * ahead, z: G.z + fz * ahead };
-}
-
-export function dropWater(G) {
-  if (G.water < 1 || (G.state !== 'playing' && G.state !== 'return')) return false;
-  G.water -= 1;
-  const p = dropPoint(G);
-  G.drops.push({ x: p.x, z: p.z, t: 0, alt: G.alt });
-  let hit = false;
-  for (const f of G.fires) {
-    if (!f.alive) continue;
-    const d = Math.hypot(f.x - p.x, f.z - p.z);
-    if (d < CFG.DROP_RADIUS) {
-      f.intensity -= CFG.DROP_KILL;
-      hit = true;
-      if (f.intensity <= 0) {
-        f.alive = false;
-        const pts = f.kind === 'building' ? CFG.BUILDING_POINTS : CFG.FIRE_POINTS;
-        G.score += pts;
-        say(G, (f.kind === 'building' ? 'HOUSE FIRE OUT  +' : 'FIRE OUT  +') + pts, 2.5);
-        soundFireOut();
+  let S = freshState();
+  function aliveFires() { return S.fires.filter((f) => f.alive); }
+  function phaseFires() {
+    return S.fires.filter((f) => f.alive && (S.phase === 1 ? f.kind === 'forest' : f.kind === 'town'));
+  }
+  function nearestFire() {
+    let best = null, bd = 1e12;
+    for (const f of phaseFires()) {
+      const d = Math.hypot(f.x - S.x, f.z - S.z);
+      if (d < bd) { bd = d; best = f; }
+    }
+    return best ? { fire: best, dist: bd } : null;
+  }
+  function say(text, secs) { S.message = text; S.messageT = secs || 2.4; }
+  function groundH() { return Terrain.heightAt(S.x, S.z); }
+  function overWater() {
+    return Terrain.typeAt(S.x, S.z) === 'sea' || Terrain.typeAt(S.x, S.z) === 'lake';
+  }
+  function onStrip() { return Terrain.onRunway(S.x, S.z); }
+  function windDrift(dt) {
+    // Steady westerly + slow deterministic gust pushes the ground track sideways.
+    const g = Math.sin(S.t * 0.11) * 6; // kt, deterministic
+    S.windGust = g;
+    const w = (C.windSpeed + g) * 0.514; // m/s from the west -> pushes +x
+    S.x += w * dt * (S.alt > 2 ? 1 : 0.15);
+  }
+  function step(dt) {
+    if (S.mode !== 'fly') return;
+    S.t += dt;
+    S.timeLeft -= dt;
+    if (S.timeLeft <= 0) { S.timeLeft = 0; return endLose('TIME UP', 'The clock ran out with fires still burning.'); }
+    if (S.messageT > 0) S.messageT -= dt;
+    // --- throttle / speed ---
+    if (Input.throttleUp) S.throttle = Math.min(1, S.throttle + dt * 0.7);
+    if (Input.throttleDown) S.throttle = Math.max(0, S.throttle - dt * 0.7);
+    const target = S.throttle * C.maxSpeed;
+    S.speed += (target - S.speed) * Math.min(1, dt * (S.throttle > 0.05 ? 0.45 : 0.9));
+    S.speed -= C.drag * dt * (S.speed / 100);
+    if (S.speed < 0) S.speed = 0;
+    // --- bank / heading ---
+    const bankWant = (Input.bankLeft ? -1 : 0) + (Input.bankRight ? 1 : 0);
+    S.bank += (bankWant * C.maxBank - S.bank) * Math.min(1, dt * 4);
+    S.hdg = (S.hdg + (-S.bank / C.maxBank) * C.turnRate * dt * (0.35 + S.speed / C.maxSpeed) + 360) % 360;
+    // --- pitch / altitude ---
+    const pitchWant = (Input.pitchUp ? -1 : 0) + (Input.pitchDown ? 1 : 0);
+    S.pitch += (pitchWant * C.maxPitch - S.pitch) * Math.min(1, dt * 3.5);
+    const flying = S.speed > C.minFlySpeed;
+    if (flying) {
+      const vs = -S.pitch * 1.35 + (S.throttle - 0.42) * 9;
+      S.alt += vs * dt;
+      S.airborne = true;
+    } else if (S.alt > groundH() + 0.5) {
+      S.alt -= C.sinkRate * dt; // settling
+    }
+    if (S.alt < groundH()) S.alt = groundH();
+    // --- move ---
+    const v = (S.speed * 1000 / 3600) * dt;
+    const hr = S.hdg * D2R;
+    S.x += Math.sin(hr) * v;
+    S.z -= Math.cos(hr) * v;
+    windDrift(dt);
+    // --- fuel ---
+    if (S.throttle > 0.05 && S.alt > groundH() + 1) {
+      S.fuel -= C.fuelBurn * (0.4 + S.throttle) * dt;
+      if (S.fuel <= 0) {
+        S.fuel = 0; S.throttle = 0;
+        if (S.messageT <= 0) { say('FUEL EMPTY — GLIDE TO THE RUNWAY', 3); AudioSys.alarm(); }
       }
     }
-  }
-  if (!hit) say(G, 'DROP MISSED — lead the fire', 2);
-  soundDrop();
-  return true;
-}
-
-// The nearest burning fire, or null when the island is safe.
-export function currentTarget(G) {
-  let best = null, bd = Infinity;
-  for (const f of G.fires) {
-    if (!f.alive) continue;
-    const d = Math.hypot(f.x - G.x, f.z - G.z);
-    if (d < bd) { bd = d; best = f; }
-  }
-  return best;
-}
-
-export function firesOut(G) {
-  let out = 0, total = 0;
-  for (const f of G.fires) { total++; if (!f.alive) out++; }
-  return { out, total };
-}
-
-// A gentle touchdown on the runway: slow, level, near the centreline and
-// inside the first half of the strip. Returns the landing bonus, 0 to
-// CFG.LANDING_MAX. A touchdown that is fast or hard is a crash instead.
-export function landingBonus(G, sinkRate) {
-  const R = CFG.RUNWAY;
-  const lateral = Math.abs(G.z - R.z);
-  const along = G.x - (R.x - R.len / 2); // metres past the threshold
-  let bonus = CFG.LANDING_MAX;
-  bonus -= lateral * 2.2; // off the centreline
-  bonus -= Math.max(0, along - 300) * 0.5; // long past the aiming point
-  bonus -= Math.max(0, G.speed - 45) * 4; // too fast at touchdown
-  bonus -= Math.max(0, sinkRate - 4) * 12; // too steep a sink
-  return Math.max(0, Math.round(bonus));
-}
-
-function crash(G, reason) {
-  if (G.state !== 'playing' && G.state !== 'return') return;
-  G.state = 'crash';
-  G.crashReason = reason;
-  soundCrash();
-}
-
-export function updateWorld(G, dt) {
-  if (G.state !== 'playing' && G.state !== 'return') return;
-  G.time += dt;
-  G.timeLeft -= dt;
-  if (G.messageT > 0) G.messageT -= dt;
-
-  // --- Controls: roll banks, pitch climbs, throttle sets speed. ---
-  const rollTarget = (KEYS.arrowleft ? -CFG.MAX_ROLL : 0) + (KEYS.arrowright ? CFG.MAX_ROLL : 0);
-  const pitchTarget = (KEYS.arrowup ? CFG.MAX_PITCH_UP : 0) + (KEYS.arrowdown ? CFG.MAX_PITCH_DN : 0);
-  G.roll += (rollTarget - G.roll) * Math.min(1, 3.2 * dt);
-  G.pitch += (pitchTarget - G.pitch) * Math.min(1, 2.6 * dt);
-  if (KEYS.w) G.throttle = Math.min(1, G.throttle + dt * 0.5);
-  if (KEYS.s) G.throttle = Math.max(0, G.throttle - dt * 0.7);
-
-  const targetSpeed = G.throttle * CFG.MAX_SPEED;
-  G.speed += (targetSpeed - G.speed) * Math.min(1, 0.55 * dt);
-  // A slow wing stops flying.
-  const stalling = G.speed < CFG.MIN_SPEED && G.alt > 6;
-  // Turn rate grows with bank and speed; pitch sets the climb.
-  G.heading += G.roll * 0.85 * (G.speed / 60) * dt;
-  let climb = Math.sin(G.pitch) * G.speed;
-  if (stalling) climb -= 7;
-  G.alt += climb * dt;
-  if (G.alt > 900) G.alt = 900;
-  const fx = Math.sin(G.heading), fz = -Math.cos(G.heading);
-  G.x += fx * G.speed * dt;
-  G.z += fz * G.speed * dt;
-  // The wind pushes the ground track, not the nose: hold the heading and
-  // the island slides sideways under you.
-  const w = windNow(G.time);
-  G.x += w.x * dt;
-  G.z += w.z * dt;
-  // Soft world edge: the island is the map, the sea goes on, but turn back.
-  const rr = islandR(G.x, G.z);
-  if (rr > 2.2) {
-    G.heading += Math.PI; // fly back over the island
-    say(G, 'TURN BACK — open sea ahead', 2);
-  }
-
-  // --- Fuel: throttle burns it, the runway gives it back. ---
-  G.fuel -= (0.05 + G.throttle * CFG.FUEL_DRAIN) * dt;
-  if (G.fuel <= 0) {
-    G.fuel = 0;
-    G.throttle = 0; // dead stick: glide her in or ditch her
-    if (!G._fuelWarned) {
-      G._fuelWarned = true;
-      say(G, 'FUEL EMPTY — glide to the runway', 4);
-      soundAlarm();
+    // --- fire spread ---
+    S.spreadTimer -= dt;
+    if (S.spreadTimer <= 0) {
+      S.spreadTimer = C.spreadEvery;
+      spreadFire();
+      if (S.mode !== 'fly') return;
     }
-  } else if (G.fuel < 20 && !G._lowWarned) {
-    G._lowWarned = true;
-    say(G, 'LOW FUEL — land on the runway to refuel', 4);
-    soundAlarm();
+    // --- drops ---
+    for (const d of S.drops) { d.z2 += d.vy * dt; d.vy += 30 * dt; d.life -= dt; }
+    S.drops = S.drops.filter((d) => d.life > 0 && d.z2 < 120);
+    if (S.splash) { S.splash.t -= dt; if (S.splash.t <= 0) S.splash = null; }
+    // --- scoop / refuel / landing ---
+    groundContact(dt);
+    // --- crash checks ---
+    const gh = groundH();
+    if (S.alt <= gh + 0.5 && S.airborne && S.speed > 40 && !onStrip()) {
+      const type = Terrain.typeAt(S.x, S.z);
+      if (type === 'sea' || type === 'lake') return endCrash('DITCHED IN THE WATER', 'Water at speed is as hard as rock.');
+      if (type === 'rock' || type === 'ash') return endCrash('INTO THE VOLCANO', 'The volcano is a wall, not a shortcut.');
+      return endCrash('TERRAIN STRIKE', 'The island is higher than the altimeter said.');
+    }
+    // Touching the strip mid-sortie is a refuel stop, not a crash — groundContact handles it.
   }
-
-  // --- Ground: land, scoop, or crash. ---
-  const ground = terrainAt(G.x, G.z);
-  G.scooping = false;
-  // A fast touchdown only counts as a crash if she was airborne just
-  // before — rolling down the runway at takeoff speed is normal.
-  const wasAir = G.alt > ground.h + 15;
-  const sinkRate = -climb;
-  if (G.alt <= ground.h + 2) {
-    if (ground.t === 'runway') {
-      if (climb < -9 || (G.speed > 72 && wasAir)) {
-        crash(G, 'HARD LANDING ON THE RUNWAY');
-      } else {
-        G.alt = ground.h + 2;
-        G.landed = true;
-        G.fuel = 100;
-        G._fuelWarned = false;
-        G._lowWarned = false;
-        if (G.phase === 'return' && G.speed < 60) {
-          // The finale: a precision landing ends the sortie.
-          G.landingBonus = landingBonus(G, Math.max(0, sinkRate));
-          G.score += G.landingBonus;
-          G.winBonus = Math.round(Math.max(0, G.timeLeft)) * CFG.WIN_TIME_BONUS;
-          G.score += G.winBonus;
-          G.state = 'win';
-          soundWin();
-        } else if (G.speed < 4) {
-          say(G, 'REFUELLED — throttle up to take off', 2.5);
-        }
+  function groundContact(dt) {
+    const gh = groundH();
+    const onGround = S.alt <= gh + 0.6;
+    if (!onGround || !S.airborne) return;
+    if (!onStrip()) return;
+    // On the runway, slow: refuel + (phase 3) score the landing.
+    if (S.speed < 60) {
+      if (S.fuel < C.fuelMax) { S.fuel = C.fuelMax; S.stats.refuels++; say('REFUELLED — TANK FULL', 2); }
+      if (S.phase === 3 && !S.landed) {
+        S.landed = true;
+        scoreLanding();
       }
-    } else if ((ground.t === 'sea' || ground.t === 'lake') && G.speed < CFG.SCOOP_SPEED) {
-      // Skim low and slow: the tank fills, one drop at a time.
-      G.alt = ground.h + 2;
-      G.scooping = true;
-      G.water = Math.min(CFG.TANK_DROPS, G.water + dt * 0.55);
-      if (G.water >= CFG.TANK_DROPS && !G._scoopSaid) {
-        G._scoopSaid = true;
-        say(G, 'TANK FULL — back to the fires', 2);
-        soundScoop();
-      }
-    } else if (ground.t === 'sea' || ground.t === 'lake') {
-      crash(G, 'DITCHED IN THE WATER AT SPEED');
+    } else if (S.speed > C.landMaxSpeed && S.phase === 3 && !S.landed) {
+      return endCrash('HARD LANDING', 'Touchdown over ' + C.landMaxSpeed + ' km/h breaks the gear.');
+    }
+  }
+  function scoreLanding() {
+    const centre = Math.abs(S.z - C.runway.z);
+    const centrePts = Math.max(0, 200 - centre * 2.2);
+    const speedPts = Math.max(0, 120 - Math.max(0, S.speed - 90) * 1.1);
+    const sinkPts = 80; // sink rate is already survivable by construction here
+    S.landBonus = Math.round(Math.min(C.landBonusMax, centrePts + speedPts + sinkPts));
+    S.timeBonus = Math.round(S.timeLeft * 3);
+    S.score += S.landBonus + S.timeBonus;
+    endWin('LANDED ON THE RUNWAY', 'Centreline ' + Math.round(centre) + ' m off · touchdown ' + Math.round(S.speed) + ' km/h');
+  }
+  function spreadFire() {
+    if (S.phase !== 1) return; // fires only spread while the forest phase runs
+    const alive = aliveFires().length;
+    if (alive >= C.maxFires) return endLose('TOO MANY FIRES', alive + ' fires burning — the island is lost.');
+    const spare = S.spares.find((s) => !s.alive);
+    if (!spare) return;
+    spare.alive = true;
+    S.fires.push({ x: spare.x, z: spare.z, kind: 'forest', alive: true, heat: 1 });
+    say('NEW FIRE SPOTTED — SMOKE ON THE HORIZON', 3);
+    AudioSys.alarm();
+  }
+  function dropWater() {
+    if (S.mode !== 'fly' || S.water <= 0 || S.alt <= groundH() + 2) return false;
+    S.water--;
+    S.stats.drops++;
+    AudioSys.drop();
+    const hr = S.hdg * D2R;
+    const dx = S.x + Math.sin(hr) * 40, dz = S.z - Math.cos(hr) * 40;
+    S.drops.push({ x: dx, z: dz, z2: S.alt, vy: 6, life: 3 });
+    // Resolve the drop against the nearest fire of the current phase.
+    const nf = nearestFire();
+    let hit = null;
+    if (nf && nf.dist < 420) {
+      const d = Math.hypot(nf.fire.x - dx, nf.fire.z - dz);
+      if (d < C.dropRadius + 60) hit = nf.fire;
+    }
+    if (hit) {
+      hit.alive = false;
+      const pts = hit.kind === 'town' ? C.townScore : C.fireScore;
+      S.score += pts;
+      S.firesOut++;
+      if (hit.kind === 'town') S.townOut++;
+      S.splash = { x: hit.x, z: hit.z, t: 1.4 };
+      say((hit.kind === 'town' ? 'TOWN FIRE OUT  +' : 'FIRE OUT  +') + pts, 2.2);
+      AudioSys.fireOut();
+      checkPhase();
     } else {
-      crash(G, 'CRASHED INTO THE GROUND');
+      say('DROP MISSED — LEAD THE TARGET', 1.6);
     }
-  } else {
-    G.landed = false;
+    return true;
   }
-  // The volcano is a wall, not a hill.
-  const dv = Math.hypot(G.x - CFG.VOLCANO.x, G.z - CFG.VOLCANO.z);
-  if (dv < 130 && G.alt < CFG.VOLCANO.peak + 25) crash(G, 'FLEW INTO THE VOLCANO');
-
-  // --- Water drops fall and fade. ---
-  for (const d of G.drops) d.t += dt;
-  G.drops = G.drops.filter((d) => d.t < 1.6);
-
-  // --- Fires grow, and a hot forest fire throws a new one nearby. ---
-  let alive = 0;
-  for (const f of G.fires) {
-    if (!f.alive) continue;
-    alive++;
-    const growth = f.kind === 'building' ? 0.02 : 0.012;
-    f.intensity = Math.min(1.6, f.intensity + dt * growth);
-    f.spreadIn -= dt;
-    if (f.kind === 'forest' && f.spreadIn <= 0) {
-      f.spreadIn = 34; // deterministic re-arm: no Math.random in the game
-      const total = G.fires.length;
-      if (total < CFG.FIRES_MAX) {
-        const a = (f.x * 0.37 + f.z * 0.91) % (Math.PI * 2);
-        const nx = f.x + Math.cos(a) * 150;
-        const nz = f.z + Math.sin(a) * 150;
-        const tt = terrainAt(nx, nz).t;
-        if ((tt === 'forest' || tt === 'grass') && !G.fires.some((o) => o.alive && Math.hypot(o.x - nx, o.z - nz) < 120)) {
-          G.fires.push({ x: nx, z: nz, kind: 'forest', intensity: 0.5, alive: true, spreadIn: 34 });
-          say(G, 'NEW FIRE — the wind is spreading it', 3);
-          soundAlarm();
-        }
-      }
+  function checkPhase() {
+    if (S.phase === 1 && !S.fires.some((f) => f.alive && f.kind === 'forest')) {
+      S.phase = 2;
+      say('PHASE 2/3 — TOWN FIRES BURNING', 3.2);
+      AudioSys.alarm();
+    } else if (S.phase === 2 && !S.fires.some((f) => f.alive)) {
+      S.phase = 3;
+      S.timeLeft += 60;
+      say('PHASE 3/3 — ALL FIRES OUT · LAND ON THE RUNWAY', 3.4);
+      AudioSys.win();
     }
   }
-
-  // --- Endings. ---
-  if (G.phase === 'fires' && alive === 0) {
-    // Every fire is out: the island is safe. Now bring her home.
-    G.phase = 'return';
-    G.timeLeft += CFG.RETURN_BONUS_TIME;
-    say(G, 'ALL FIRES OUT — LAND ON THE RUNWAY', 5);
-    soundWin();
-  } else if (G.timeLeft <= 0) {
-    G.state = 'lose';
-    G.crashReason = G.phase === 'return'
-      ? 'OUT OF TIME ON THE WAY HOME'
-      : 'THE CLOCK RAN OUT';
-  } else if (alive >= CFG.FIRES_MAX) {
-    G.state = 'lose';
-    G.crashReason = 'THE FIRE TOOK THE ISLAND';
+  function tryScoop() {
+    if (S.mode !== 'fly') return;
+    if (S.water >= C.waterMax) return;
+    if (S.alt < C.scoopAlt && overWater() && S.speed < C.scoopMaxSpeed && S.speed > 60) {
+      S.water = C.waterMax;
+      S.stats.scoops++;
+      say('SCOOPED — TANK FULL', 2);
+      AudioSys.scoop();
+    }
   }
-}
+  function endWin(detail, sub) {
+    S.mode = 'win'; S.endReason = detail; S.endDetail = sub || '';
+    AudioSys.win();
+  }
+  function endLose(reason, sub) {
+    S.mode = 'lose'; S.endReason = reason; S.endDetail = sub || '';
+    AudioSys.crash();
+  }
+  function endCrash(reason, sub) {
+    S.mode = 'crash'; S.endReason = reason; S.endDetail = sub || '';
+    AudioSys.crash();
+  }
+  function start() {
+    S = freshState();
+    S.mode = 'fly';
+    S.x = C.runway.x - C.runway.len / 2 + 60; S.z = C.runway.z; S.alt = 2;
+    S.hdg = 90; S.speed = 0; S.throttle = 0.55;
+    say('PHASE 1/3 — 6 FOREST FIRES · SCOOP OVER WATER', 3.4);
+  }
+  function reset() { S = freshState(); }
+  return {
+    get S() { return S; },
+    set S(v) { S = v; },
+    freshState, start, reset, step, dropWater, tryScoop,
+    aliveFires, phaseFires, nearestFire, groundH, overWater, onStrip, say,
+    endWin, endLose, endCrash,
+  };
+})();

@@ -1,8 +1,6 @@
-// random.js: one seeded generator, so the island, the trees and the
-// fires are the same on every run. No Math.random() anywhere in the game.
-
-// mulberry32 — small, fast, deterministic.
-export function makeRng(seed) {
+// Seeded randomness. One job: deterministic numbers — the seeded RNG below is
+// the game's only source of chance.
+function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
     a |= 0; a = (a + 0x6D2B79F5) | 0;
@@ -11,19 +9,21 @@ export function makeRng(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-
-// Deterministic 2D value noise from a sin hash — same input, same output,
-// on every machine, with no stored table.
-export function hash2(ix, iz) {
-  const s = Math.sin(ix * 127.1 + iz * 311.7) * 43758.5453;
-  return s - Math.floor(s);
+// Stable 2D hash -> [0,1), for value noise that never changes between runs.
+function hash2(ix, iz, seed) {
+  let h = (ix * 374761393 + iz * 668265263 + seed * 974634211) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (((h ^ (h >>> 16)) >>> 0) % 10000) / 10000;
 }
-
-export function valueNoise(x, z) {
+function smooth(t) { return t * t * (3 - 2 * t); }
+function valueNoise(x, z, seed) {
   const ix = Math.floor(x), iz = Math.floor(z);
-  const fx = x - ix, fz = z - iz;
-  const sx = fx * fx * (3 - 2 * fx), sz = fz * fz * (3 - 2 * fz);
-  const a = hash2(ix, iz), b = hash2(ix + 1, iz);
-  const c = hash2(ix, iz + 1), d = hash2(ix + 1, iz + 1);
-  return a + (b - a) * sx + (c - a) * sz + (a - b - c + d) * sx * sz;
+  const fx = smooth(x - ix), fz = smooth(z - iz);
+  const a = hash2(ix, iz, seed), b = hash2(ix + 1, iz, seed);
+  const c = hash2(ix, iz + 1, seed), d = hash2(ix + 1, iz + 1, seed);
+  return (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fz;
+}
+function fbm(x, z, seed) {
+  return valueNoise(x, z, seed) * 0.6 + valueNoise(x * 2.3, z * 2.3, seed + 7) * 0.3
+    + valueNoise(x * 5.1, z * 5.1, seed + 13) * 0.1;
 }

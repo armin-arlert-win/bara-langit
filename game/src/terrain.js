@@ -1,106 +1,79 @@
-// terrain.js: the island itself — what kind of ground is at (x, z),
-// how high it is, and what colour it paints at dusk. One function feeds
-// both the physics (world.js) and the 3D mesh (render.js), so the plane
-// never disagrees with the ground it sees.
-
-import { CFG } from './config.js';
-import { makeRng, valueNoise, hash2 } from './random.js';
-
-// Elliptical distance from the island centre (0, 0). r < 1 is land.
-export function islandR(x, z) {
-  const ex = x / CFG.ISLAND_RX, ez = z / CFG.ISLAND_RZ;
-  return Math.sqrt(ex * ex + ez * ez);
-}
-
-export function terrainAt(x, z) {
-  const r = islandR(x, z);
-  const dv = Math.hypot(x - CFG.VOLCANO.x, z - CFG.VOLCANO.z);
-  const dl = Math.hypot(x - CFG.LAKE.x, z - CFG.LAKE.z);
-  // Runway strip: a flat rectangle on the south coast, heading east.
-  const rx = x - CFG.RUNWAY.x, rz = z - CFG.RUNWAY.z;
-  const onRunway = Math.abs(rx) < CFG.RUNWAY.len / 2 && Math.abs(rz) < CFG.RUNWAY.w / 2;
-  if (onRunway) return { t: 'runway', h: 4 };
-  // Village pad: flat ground for the houses, east of the runway.
-  const vx = x - CFG.VILLAGE.x, vz = z - CFG.VILLAGE.z;
-  if (Math.abs(vx) < 120 && Math.abs(vz) < 90) return { t: 'village', h: 5 };
-  if (dl < CFG.LAKE.r) return { t: 'lake', h: 2 };
-  if (r > 1) return { t: 'sea', h: 0 };
-  // Rolling hills that rise towards the middle of the island.
-  let h = Math.pow(1 - r, 1.3) * 95 + valueNoise(x * 0.004, z * 0.004) * 16;
-  if (dv < CFG.VOLCANO.base) {
-    h = Math.max(h, CFG.VOLCANO.peak * Math.pow(1 - dv / CFG.VOLCANO.base, 1.15));
+// Pulau Arang: the island itself. One job: what is at (x, z) — type and height.
+// Types: sea, beach, grass, forest, field, lake, rock, ash, runway, town.
+const Terrain = (() => {
+  const C = CFG;
+  function dist(x, z, cx, cz) { return Math.hypot(x - cx, z - cz); }
+  function inLake(x, z) {
+    const dx = (x - C.lake.x) / C.lake.rx, dz = (z - C.lake.z) / C.lake.rz;
+    return dx * dx + dz * dz < 1;
   }
-  if (dv < 190) return { t: 'ash', h };
-  if (dv < CFG.VOLCANO.base) return { t: 'rock', h };
-  if (r > 0.93) return { t: 'sand', h: Math.max(h, 3) };
-  const forest = valueNoise(x * 0.006 + 7.3, z * 0.006 - 2.1) > 0.58;
-  if (forest) return { t: 'forest', h };
-  const field = valueNoise(x * 0.004 + 40.7, z * 0.004 - 11.9);
-  if (field > 0.40 && field < 0.56) return { t: 'field', h };
-  return { t: 'grass', h };
-}
-
-// Dusk palette, as plain [r, g, b] triples. The sun and fog do the haze;
-// these are the colours the ground is.
-export function terrainColor(kind) {
-  if (kind === 'sea') return [33, 88, 138];
-  if (kind === 'lake') return [46, 127, 180];
-  if (kind === 'sand') return [207, 169, 110];
-  if (kind === 'grass') return [95, 128, 66];
-  if (kind === 'forest') return [52, 102, 48];
-  if (kind === 'field') return [168, 137, 78];
-  if (kind === 'rock') return [92, 82, 76];
-  if (kind === 'ash') return [60, 54, 50];
-  if (kind === 'village') return [120, 104, 78];
-  return [51, 54, 59]; // runway asphalt
-}
-
-// Forest fires start in the forest, away from the runway and the volcano.
-export function forestFireSpots(seed) {
-  const rng = makeRng(seed);
-  const spots = [];
-  let guard = 0;
-  while (spots.length < CFG.FIRES_FOREST && guard++ < 4000) {
-    const a = rng() * Math.PI * 2;
-    const rr = 0.25 + rng() * 0.6;
-    const x = Math.cos(a) * CFG.ISLAND_RX * rr;
-    const z = Math.sin(a) * CFG.ISLAND_RZ * rr;
-    const t = terrainAt(x, z).t;
-    if (t !== 'forest' && t !== 'grass') continue;
-    if (Math.hypot(x - CFG.RUNWAY.x, z - CFG.RUNWAY.z) < 500) continue;
-    if (Math.hypot(x - CFG.VOLCANO.x, z - CFG.VOLCANO.z) < 560) continue;
-    if (spots.some((s) => Math.hypot(s.x - x, s.z - z) < 320)) continue;
-    spots.push({ x, z });
+  function onRunway(x, z) {
+    const dx = x - C.runway.x, dz = z - C.runway.z;
+    return Math.abs(dx) < C.runway.len / 2 && Math.abs(dz) < C.runway.w / 2;
   }
-  return spots;
-}
-
-// The two building fires: two houses in the village, east of the runway.
-export function buildingFireSpots() {
-  const V = CFG.VILLAGE;
-  return [
-    { x: V.x - 45, z: V.z - 30 },
-    { x: V.x + 55, z: V.z + 25 },
-  ];
-}
-
-// Pine positions for the instanced tree mesh: only where the ground is
-// forest, and never on the runway, the lake, the village or the volcano.
-export function treeSpots(count, seed) {
-  const rng = makeRng(seed);
-  const spots = [];
-  let guard = 0;
-  while (spots.length < count && guard++ < count * 40) {
-    const x = (rng() * 2 - 1) * CFG.ISLAND_RX * 0.95;
-    const z = (rng() * 2 - 1) * CFG.ISLAND_RZ * 0.95;
-    if (terrainAt(x, z).t !== 'forest') continue;
-    const s = 0.7 + rng() * 0.9;
-    spots.push({ x, z, h: terrainAt(x, z).h, s, rot: rng() * Math.PI * 2 });
+  function inTown(x, z) {
+    return Math.abs(x - C.town.x) < 190 && Math.abs(z - C.town.z) < 150;
   }
-  return spots;
-}
-
-// A cheap deterministic speckle so the sea is not one flat colour.
-export function seaShade(x, z) {
-  return hash2(Math.floor(x / 70), Math.floor(z / 70)) > 0.5 ? 1 : 0.88;
-}
+  // Height in metres. Sea is 0; the island rises gently; the volcano is a cone.
+  function heightAt(x, z) {
+    const r = Math.hypot(x, z);
+    if (r > C.islandR) return 0;
+    const dv = dist(x, z, C.volcano.x, C.volcano.z);
+    if (dv < C.volcano.r) {
+      const t = 1 - dv / C.volcano.r;
+      return 30 + t * t * C.volcano.h;
+    }
+    const hills = fbm(x * 0.0016 + 40, z * 0.0016 + 9, C.seed);
+    const shore = Math.max(0, 1 - r / C.islandR);
+    let h = 4 + hills * 46 * shore;
+    if (inLake(x, z)) h = 0;
+    return h;
+  }
+  function typeAt(x, z) {
+    if (onRunway(x, z)) return 'runway';
+    if (inLake(x, z)) return 'lake';
+    const r = Math.hypot(x, z);
+    if (r > C.islandR) return 'sea';
+    const dv = dist(x, z, C.volcano.x, C.volcano.z);
+    if (dv < C.volcano.r * 0.32) return 'ash';
+    if (dv < C.volcano.r) return 'rock';
+    if (r > C.islandR - 130) return 'beach';
+    if (inTown(x, z)) return 'town';
+    const n = fbm(x * 0.0021 + 3, z * 0.0021 + 17, C.seed + 31);
+    if (n > 0.66) return 'forest';
+    if (n > 0.55) return 'field';
+    return 'grass';
+  }
+  // Fixed fire spots, picked once from the seeded RNG so every run matches.
+  function fireSpots() {
+    const rng = mulberry32(C.seed + 5);
+    const spots = [];
+    const forestPool = [
+      [-1500, -900], [-900, -1400], [-300, -1000], [400, -1300], [900, -900],
+      [-1600, 300], [-700, -300], [200, -500], [700, 300], [-1200, 1200],
+      [300, 900], [1100, 600], [-300, 1500], [900, 1400],
+    ];
+    for (let i = 0; i < C.forestFires; i++) {
+      const p = forestPool[Math.floor(rng() * forestPool.length)];
+      if (spots.some((s) => s.x === p[0] && s.z === p[1])) { i--; continue; }
+      spots.push({ x: p[0], z: p[1], kind: 'forest', alive: true, heat: 1 });
+    }
+    const townPool = [
+      [C.town.x - 90, C.town.z - 60], [C.town.x + 80, C.town.z + 40],
+      [C.town.x - 40, C.town.z + 90], [C.town.x + 120, C.town.z - 80],
+    ];
+    for (let i = 0; i < C.townFires; i++) {
+      const p = townPool[i * 2];
+      spots.push({ x: p[0], z: p[1], kind: 'town', alive: true, heat: 1.6 });
+    }
+    return spots;
+  }
+  // Spare spots the spread can ignite later (forest only).
+  function spreadSpots() {
+    return [
+      [-1800, -400], [-500, -1600], [1200, -1200], [-1400, 800],
+      [600, 1200], [-100, 300], [1500, 200], [-1900, 1400],
+    ].map(([x, z]) => ({ x, z, kind: 'forest', alive: false, heat: 1 }));
+  }
+  return { heightAt, typeAt, inLake, onRunway, inTown, fireSpots, spreadSpots };
+})();
