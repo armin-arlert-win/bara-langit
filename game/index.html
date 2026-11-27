@@ -1,110 +1,27 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>BARA LANGIT — Wildfire Air Tanker</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<script type="importmap">
-{"imports": {"three": "./vendor/three.module.min.js"}}
-</script>
 <style>
-  html, body { margin: 0; padding: 0; background: #0b0e18; height: 100%; }
-  body { display: flex; align-items: center; justify-content: center; }
-  #stage { position: relative; width: min(100vw, 160vh); aspect-ratio: 1280 / 800;
-    container-type: size; background: #141d38; overflow: hidden; }
-  #game { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-  #hud { position: absolute; inset: 0; pointer-events: none;
-    font-family: ui-monospace, Menlo, Consolas, monospace; color: #e8ecf8;
-    text-shadow: 0 1px 3px rgba(0,0,0,0.9), 0 0 8px rgba(0,0,0,0.6); }
-  .panel { background: rgba(8, 10, 20, 0.55); border-radius: 0.5cqw; padding: 0.4cqw 0.8cqw; }
-  .topbar { position: absolute; top: 1cqw; left: 1cqw; right: 1cqw;
-    display: flex; justify-content: space-between; align-items: flex-start; }
-  .flight-data { font-size: 1.7cqw; font-weight: bold; letter-spacing: 0.05em; white-space: nowrap; }
-  .flight-data span { margin-right: 1.2cqw; }
-  .clockbox { text-align: center; }
-  #hud-clock { font-size: 2.6cqw; font-weight: bold; color: #ffd27a; }
-  #hud-score { font-size: 1.5cqw; color: #ffd27a; }
-  #compass { width: 26cqw; height: 2.2cqw; margin-top: 0.3cqw; }
-  #minimap { width: 15cqw; height: 12cqw; border: 1px solid rgba(232,236,248,0.5); }
-  .mapbox { display: flex; flex-direction: column; align-items: flex-end; }
-  .bottomleft { position: absolute; left: 1cqw; bottom: 1cqw; display: flex; align-items: flex-end; gap: 0.8cqw; }
-  #attitude { width: 8.6cqw; height: 8.6cqw; }
-  .thr-wrap { width: 1.2cqw; height: 8.6cqw; background: rgba(8,10,20,0.6);
-    border: 1px solid rgba(232,236,248,0.5); border-radius: 0.3cqw; position: relative; overflow: hidden; }
-  #hud-thr { position: absolute; bottom: 0; left: 0; width: 100%; height: 0%;
-    background: linear-gradient(to top, #2e7d32, #7ddc7a); }
-  .thr-label, .att-label { font-size: 1.1cqw; color: #c8cede; text-align: center; }
-  .bottommid { position: absolute; left: 50%; bottom: 1cqw; transform: translateX(-50%);
-    display: flex; align-items: center; gap: 1.2cqw; font-size: 1.4cqw; }
-  .fuel-wrap { width: 14cqw; height: 1.4cqw; background: rgba(8,10,20,0.6);
-    border: 1px solid rgba(232,236,248,0.5); border-radius: 0.3cqw; overflow: hidden; }
-  #hud-fuel { height: 100%; width: 100%; background: #ffb13c; }
-  #hud-water .drop { color: #7ec8ff; font-size: 1.8cqw; margin-right: 0.2cqw; }
-  .bottomright { position: absolute; right: 1cqw; bottom: 1cqw; text-align: right;
-    font-size: 1.5cqw; }
-  #hud-fires { font-weight: bold; color: #ffb13c; }
-  #hud-target { color: #ffd27a; margin-top: 0.3cqw; }
-  .hint { font-size: 1.1cqw; color: #c8cede; margin-top: 0.4cqw; text-align: right; }
-  #hud-message { position: absolute; top: 28%; left: 0; right: 0; text-align: center;
-    font-size: 2.4cqw; font-weight: bold; color: #ffd27a; letter-spacing: 0.08em;
-    background: rgba(8, 10, 20, 0.65); padding: 0.5cqw 0; opacity: 0; }
-  .screen { position: absolute; inset: 0; display: none; flex-direction: column;
-    align-items: center; justify-content: center; text-align: center;
-    background: rgba(6, 8, 18, 0.38); }
-  .screen h1 { font-size: 6.5cqw; color: #ffd27a; margin: 0 0 0.6cqw; letter-spacing: 0.12em; }
-  .screen h2 { font-size: 2.2cqw; color: #e8ecf8; margin: 0 0 1.2cqw; font-weight: normal; }
-  .screen p { font-size: 1.6cqw; color: #c8cede; line-height: 1.7; margin: 0; }
-  #end-head { font-size: 5.5cqw; color: #ffd27a; margin: 0 0 0.8cqw; letter-spacing: 0.1em; }
-  #end-body { font-size: 2cqw; color: #e8ecf8; line-height: 1.7; }
-  #test-results { display: none; position: fixed; left: 0; top: 0; color: #fff;
-    font: 14px monospace; white-space: pre; background: #000; padding: 8px; z-index: 9; }
+  html, body { margin: 0; padding: 0; background: #0a0d16; height: 100%; overflow: hidden; }
+  #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
+  canvas { width: min(100vw, 160vh); height: auto; display: block; background: #141a33; }
+  #selftest { color: #9fe8a9; font: 14px monospace; white-space: pre; }
 </style>
 </head>
 <body>
-<div id="stage">
-  <canvas id="game" width="1280" height="800"></canvas>
-  <div id="hud">
-    <div class="topbar">
-      <div class="flight-data panel"><span id="hud-alt">ALT 0 ft</span><span id="hud-spd">SPD 0 km/h</span><span id="hud-hdg">HDG 000°</span></div>
-      <div class="clockbox">
-        <div id="hud-clock">03:00</div>
-        <div id="hud-score">SCORE 0</div>
-        <canvas id="compass" width="332" height="28"></canvas>
-      </div>
-      <div class="mapbox">
-        <canvas id="minimap" width="190" height="150"></canvas>
-        <div class="hint">SPACE — DROP WATER · P — PAUSE</div>
-      </div>
-    </div>
-    <div class="bottomleft">
-      <div><canvas id="attitude" width="110" height="110"></canvas><div class="att-label">ATTITUDE</div></div>
-      <div><div class="thr-wrap"><div id="hud-thr"></div></div><div class="thr-label">THR</div></div>
-    </div>
-    <div class="bottommid panel">
-      <span>FUEL</span><div class="fuel-wrap"><div id="hud-fuel"></div></div>
-      <span>WATER</span><span id="hud-water"><span class="drop">●</span><span class="drop">●</span><span class="drop">●</span></span>
-      <span id="hud-wind">WIND 000° 0 kt</span>
-    </div>
-    <div class="bottomright">
-      <div id="hud-fires">FIRES OUT 0 / 10</div>
-      <div id="hud-target"></div>
-    </div>
-    <div id="hud-message"></div>
-    <div id="screen-title" class="screen">
-      <h1>BARA LANGIT</h1>
-      <h2>WILDFIRE AIR TANKER — PULAU ARANG AT DUSK</h2>
-      <p>Ten fires are burning across the island — eight in the forest, two in the village.<br>
-      Scoop water from the sea or the lake, drop it on the flames, mind the volcano,<br>
-      land on the runway to refuel — then bring her home with a precision landing.<br><br>
-      ENTER or CLICK — FLY THE SORTIE</p>
-    </div>
-    <div id="screen-end" class="screen">
-      <h1 id="end-head"></h1>
-      <p id="end-body"></p>
-    </div>
-  </div>
-</div>
-<div id="test-results"></div>
-<script type="module" src="./src/main.js"></script>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script src="src/config.js"></script>
+<script src="src/random.js"></script>
+<script src="src/terrain.js"></script>
+<script src="src/input.js"></script>
+<script src="src/audio.js"></script>
+<script src="src/world.js"></script>
+<script src="src/render.js"></script>
+<script src="src/hud.js"></script>
+<script src="src/shots.js"></script>
+<script src="src/main.js"></script>
 </body>
 </html>
